@@ -1,0 +1,8 @@
+# Packaging for CurseForge (BigWigs packager format): the download is the QuestLadder folder
+# without the offline tests and repo files.
+package-as: QuestLadder
+
+ignore:
+  - tests
+  - .gitignore
+  - .pkgmeta

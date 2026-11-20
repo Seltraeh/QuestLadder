@@ -1,0 +1,10 @@
+<Bindings>
+    <Binding name="CLICK QuestLadderUseButton:LeftButton" header="QUESTLADDER" category="ADDONS">
+    </Binding>
+    <Binding name="QUESTLADDER_SKIP" category="ADDONS">
+        QuestLadder_Skip()
+    </Binding>
+    <Binding name="QUESTLADDER_TOGGLE" category="ADDONS">
+        QuestLadder_Toggle()
+    </Binding>
+</Bindings>

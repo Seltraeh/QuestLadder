@@ -1,0 +1,2 @@
+# Keep line endings as they are (WoW reads either)
+* text=auto eol=lf
