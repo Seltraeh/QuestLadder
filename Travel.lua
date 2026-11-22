@@ -236,11 +236,18 @@ function Travel.Options(net, a, b)
     return out
 end
 
---- Memoized cost function for the planner.
-function Travel.NewCost(net)
+--- True when the network has a known flight path or a zeppelin (otherwise every leg is a walk).
+function Travel.HasFlights(net)
+    if net.zeppelins ~= nil and net.zeppelins[1] ~= nil then return true end
+    for _, n in ipairs(net.nodes or {}) do if n.known then return true end end
+    return false
+end
+
+--- Memoized cost function for the planner. `afkWeight` (optional) replaces AFK_WEIGHT for this
+--- function only: 1.0 counts a minute in the air as a minute (the planner's second first guess).
+function Travel.NewCost(net, afkWeight)
     local cache = setmetatable({}, { __mode = "k" })
-    local hasFlights = (net.zeppelins ~= nil and net.zeppelins[1] ~= nil)
-    for _, n in ipairs(net.nodes or {}) do if n.known then hasFlights = true break end end
+    local hasFlights = Travel.HasFlights(net)
     return function(a, b)
         if not a or not b then return 0 end
         if not hasFlights then return walk(net, a, b) end
@@ -248,7 +255,16 @@ function Travel.NewCost(net)
         if not row then row = setmetatable({}, { __mode = "k" }); cache[a] = row end
         local c = row[b]
         if not c then
-            c = Travel.Leg(net, a, b)
+            if afkWeight then
+                local saved = Travel.AFK_WEIGHT
+                Travel.AFK_WEIGHT = afkWeight
+                local ok, cost = pcall(Travel.Leg, net, a, b)
+                Travel.AFK_WEIGHT = saved
+                if not ok then error(cost, 0) end
+                c = cost
+            else
+                c = Travel.Leg(net, a, b)
+            end
             row[b] = c
         end
         return c
@@ -630,6 +646,12 @@ local function hearthState()
 end
 Travel.HearthState = hearthState
 
+--- Blizzard keeps retired test nodes in the list, named "zz..." ("zzOLDPowderfuse Port,
+--- Riverglades" sits on top of Ratchet's): they're not real flight paths.
+function Travel.IsRetiredNode(name)
+    return type(name) == "string" and name:sub(1, 2):lower() == "zz"
+end
+
 function Travel.BuildNetwork(player)
     local net = { nodes = {}, speed = Geo.RUN_SPEED }
     if player.skills and player.skills[Travel.RIDING_SKILL] then
@@ -644,7 +666,7 @@ function Travel.BuildNetwork(player)
             for _, info in ipairs(list) do
                 local pos = info.position
                 local x, y = pos and (pos.x or (pos.GetXY and select(1, pos:GetXY()))), pos and (pos.y or (pos.GetXY and select(2, pos:GetXY())))
-                if x and y and factionOk(info.faction, player.faction) then
+                if x and y and factionOk(info.faction, player.faction) and not Travel.IsRetiredNode(info.name) then
                     local point = Geo.Point(contMap, x, y)
                     if point then
                         -- Forever reports isUndiscovered = false for every node (even the other

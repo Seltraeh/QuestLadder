@@ -86,6 +86,7 @@ function Planner.BuildTasks(ctx)
                         deps = pickupId and { pickupId } or {},
                         deferred = q.deferred,
                         mobLevel = o.mobLevel,
+                        urgent = (q.timed and not q.deferred) or nil, -- a timed quest: goes first
                     })
                     objIds[#objIds + 1] = t.id
                 end
@@ -104,6 +105,7 @@ function Planner.BuildTasks(ctx)
             frees = q.questItems,
             reward = q.hasItemReward and 1 or 0,
             deferred = q.deferred,
+            urgent = (q.timed and not q.deferred) or nil,
             -- "go talk to X" and delivery quests give much less XP than ones with objectives
             xpWeight = (#(q.objectives or {}) > 0) and 1 or Planner.TALK_QUEST_XP,
         })
@@ -194,6 +196,7 @@ function Planner.BuildTasks(ctx)
         end
     end
     Planner.ApplyLevelGates(tasks, byId, ctx.level, ctx.xpFrac)
+    for _, t in ipairs(tasks) do if t.urgent then t.minTurnins = nil end end -- the clock beats the mob level
     return tasks, byId
 end
 
@@ -802,9 +805,188 @@ local function finishHere(order, start, opts)
 end
 Planner.FinishHere = finishHere
 
---- Orders tasks. opts: logCount, logMax, stickyId, predone, turninsBefore.
-function Planner.Solve(tasks, byId, start, opts)
-    opts = opts or {}
+---------------------------------------------------------------------------
+-- "Worth the trip": new quests whose detour costs more than they give
+---------------------------------------------------------------------------
+-- A quest giver at a hub can send you 2,000 yards out for one quest (The Barrens), while a
+-- quest whose mobs you pass anyway costs next to nothing. So once the route is solved, each new
+-- quest is taken out of it on paper, with its chain follow-ups: the travel that saves is weighed
+-- against its XP (quest.tripXP, set by Ladder: XP at your level, plus the next quest when it
+-- only leads on). It goes only when that XP is clearly less than killing mobs for the same time
+-- would give: under TRIP_KEEP_SHARE of GrindRate (real grinding has eating and drinking in it,
+-- so a near tie stays). Quests whose work is close together are also weighed as a group
+-- (TRIP_AREA_YARDS): two quests sharing one long walk each look cheap while the other one pays
+-- for the trip. The worst one goes, the route is polished again, and so on. Quests marked
+-- quest.keep (class quests, gear upgrades, Forever's must-do quests) stay.
+-- 0.4.0: quests in your log you've outgrown (quest.outgrown, set by Ladder: 3+ levels under you)
+-- are weighed the same way, so the route stops dragging you back to old zones for them; other
+-- quests in your log stay. Bigger groups are weighed too: a region (TRIP_REGION_YARDS) and
+-- everything on another continent, since one ocean crossing can carry a dozen quests that each
+-- look cheap on their own.
+Planner.SECONDS_PER_KILL = 20     -- as in EstimateObjective
+Planner.TRIP_FREE_SECONDS = 30    -- adds less travel than this: always worth it
+Planner.TRIP_KEEP_SHARE = 0.75    -- worth at least this share of grinding for the travel: stays
+Planner.TRIP_AREA_YARDS = 400
+Planner.TRIP_REGION_YARDS = 1500
+Planner.TRIP_AWAY_GROUP = true    -- weigh everything on another continent together
+Planner.TRIP_MAX_DROPS = 10
+
+--- XP per second killing mobs of your level (Classic: 45 + 5 x level per kill).
+function Planner.GrindRate(level)
+    return (45 + 5 * (level or 1)) / Planner.SECONDS_PER_KILL
+end
+
+--- Where a quest's work is: the middle of its objectives, else its turn-in.
+function Planner.WorkCentre(q)
+    local sx, sy, n, cont = 0, 0, 0, nil
+    for _, o in ipairs(q.objectives or {}) do
+        local l = o.loc
+        if l and l.wx and (cont == nil or l.cont == cont) then
+            cont = l.cont
+            sx, sy, n = sx + l.wx, sy + l.wy, n + 1
+        end
+    end
+    if n > 0 then return { cont = cont, wx = sx / n, wy = sy / n } end
+    return q.turnin or q.pickup
+end
+
+local function pruneTrips(order, start, opts)
+    local rate = opts.tripRate
+    local pruned = {}
+    if not rate or rate <= 0 then return order, pruned end
+    for _ = 1, Planner.TRIP_MAX_DROPS do
+        -- what can go: a new quest (its pickup), or an outgrown quest in your log (all its tasks)
+        local index, judged, logTasks, logIds = {}, {}, {}, {}
+        for _, t in ipairs(order) do
+            index[t.id] = t
+            local q = t.quest
+            if t.kind == "pickup" and q and q.tripXP and not q.keep then
+                judged[#judged + 1] = { id = t.id, quest = q, seeds = { t } }
+            elseif q and q.outgrown and q.tripXP and not q.keep and (t.kind == "objective" or t.kind == "turnin") then
+                if not logTasks[q.id] then logTasks[q.id] = {}; logIds[#logIds + 1] = q.id end
+                table.insert(logTasks[q.id], t)
+            end
+        end
+        table.sort(logIds)
+        for _, qid in ipairs(logIds) do
+            local ts = logTasks[qid]
+            judged[#judged + 1] = { id = "L" .. qid, quest = ts[1].quest, seeds = ts }
+        end
+        if #judged == 0 then break end
+        local base = Planner.RouteCost(order, start)
+        -- take them out with everything that depends on them (objectives, turn-in, follow-up
+        -- quests); nil when that would take out a quest that has to stay
+        local function evaluate(entries)
+            local drop, stack = {}, {}
+            for _, e in ipairs(entries) do
+                for _, s in ipairs(e.seeds) do
+                    if not drop[s] then drop[s] = true; stack[#stack + 1] = s end
+                end
+            end
+            while #stack > 0 do
+                local t = table.remove(stack)
+                for _, id in ipairs(t.dependents or {}) do
+                    local dt = index[id]
+                    if dt and not drop[dt] then drop[dt] = true; stack[#stack + 1] = dt end
+                end
+            end
+            local xp, quests, counted, pickedUp = 0, {}, {}, {}
+            for t in pairs(drop) do
+                if t.kind == "pickup" and t.quest then pickedUp[t.quest] = true end
+            end
+            for t in pairs(drop) do
+                local q = t.quest
+                if t.kind == "pickup" then
+                    if not q or q.keep or not q.tripXP then return nil end
+                elseif t.kind == "objective" or t.kind == "turnin" then
+                    -- a quest in your log only goes whole, and only when you've outgrown it
+                    if q and not pickedUp[q] and not (q.outgrown and q.tripXP and not q.keep) then return nil end
+                else
+                    return nil -- a vendor or trainer stop waits on it: leave it alone
+                end
+                if q and not counted[q] then
+                    counted[q] = true
+                    xp = xp + q.tripXP
+                    quests[#quests + 1] = q
+                end
+            end
+            -- every task of an outgrown quest goes with it, not just some
+            for q in pairs(counted) do
+                if not pickedUp[q] then
+                    for _, t in ipairs(logTasks[q.id] or {}) do if not drop[t] then return nil end end
+                end
+            end
+            local kept = {}
+            for _, t in ipairs(order) do if not drop[t] then kept[#kept + 1] = t end end
+            local saves = base - Planner.RouteCost(kept, start)
+            if saves <= Planner.TRIP_FREE_SECONDS then return nil end
+            local worth = xp / (saves * rate) -- share of what grinding that long would give
+            if worth >= Planner.TRIP_KEEP_SHARE then return nil end
+            return { worth = worth, saves = saves, xp = xp, quests = quests, kept = kept }
+        end
+        local worst
+        local function consider(e)
+            if e and (not worst or e.worth < worst.worth) then worst = e end
+        end
+        local seenGroup = {}
+        local function considerGroup(group, key)
+            if #group > 1 then
+                table.sort(key)
+                local k = table.concat(key, ",")
+                if not seenGroup[k] then seenGroup[k] = true; consider(evaluate(group)) end
+            end
+        end
+        local centre = {}
+        for _, p in ipairs(judged) do centre[p] = Planner.WorkCentre(p.quest) end
+        for _, p in ipairs(judged) do
+            consider(evaluate({ p }))
+            -- the quests whose work is near this one's, together: the same area, and the region
+            local here = centre[p]
+            for _, radius in ipairs({ Planner.TRIP_AREA_YARDS, Planner.TRIP_REGION_YARDS }) do
+                local group, key = {}, {}
+                for _, other in ipairs(judged) do
+                    local there = here and centre[other]
+                    local dist = there and Geo.Distance(here, there)
+                    if dist and dist <= radius then
+                        group[#group + 1] = other
+                        key[#key + 1] = other.id
+                    end
+                end
+                considerGroup(group, key)
+            end
+            if ns.MaybeYield then ns.MaybeYield(10) end
+        end
+        -- everything on another continent than you, together (one crossing carries them all)
+        local away, awayKey = {}, {}
+        for _, p in ipairs(judged) do
+            local c = centre[p]
+            if Planner.TRIP_AWAY_GROUP and c and start and c.cont ~= nil and start.cont ~= nil and c.cont ~= start.cont then
+                away[#away + 1] = p
+                awayKey[#awayKey + 1] = p.id
+            end
+        end
+        considerGroup(away, awayKey)
+        if not worst then break end
+        for _, q in ipairs(worst.quests) do
+            pruned[#pruned + 1] = { quest = q, questId = q.id, title = q.title, xp = q.tripXP,
+                                    groupXP = worst.xp, seconds = worst.saves, worth = worst.worth,
+                                    together = #worst.quests, inLog = q.outgrown or nil }
+        end
+        order = worst.kept
+        if violations(order, opts) then order = fitLevelWaits(order, start, opts) end
+        -- a quick polish between drops, the full one at the end
+        local passes = Planner.IMPROVE_PASSES
+        Planner.IMPROVE_PASSES = 1
+        order = improve(order, start, opts)
+        Planner.IMPROVE_PASSES = passes
+    end
+    if #pruned > 0 then order = improve(order, start, opts) end
+    return order, pruned
+end
+Planner.PruneTrips = pruneTrips
+
+--- First guess and polish, with the level waits fitted in.
+local function solveCore(tasks, byId, start, opts)
     local hasWaits = false
     for _, t in ipairs(tasks) do if t.minTurnins then hasWaits = true break end end
     local order
@@ -818,10 +1000,121 @@ function Planner.Solve(tasks, byId, start, opts)
         order = greedy(tasks, byId, start, opts)
         order = improve(order, start, opts)
     end
+    return order
+end
+
+---------------------------------------------------------------------------
+-- More than one first guess
+---------------------------------------------------------------------------
+-- The improvement step only moves stops a little at a time, so the first guess decides which
+-- routes it can reach. With cheap AFK flights the first guess at Sun Rock Retreat (0.3.23 diag)
+-- walked off to the north Barrens and flew back for two turn-ins 150 yards from you; the
+-- improvement step couldn't untangle it. Starting over with flights at full time, or with walking
+-- only, and polishing that under the normal costs found a route that was cheaper by the normal
+-- costs too (3303 vs 3495 s, and 5 minutes less real time). Over the 10 saved diag routes, the
+-- cheapest of the three starts beat or tied the single start every time. opts.seeds =
+-- { { name, travel = cost function } }; a seed only wins by SEED_MIN_SAVING seconds, so near-ties
+-- don't flip the route between replans. Three starts take 3-4 times as long (a 44-task plan: 0.05
+-- -> 0.2 s, about a second in game at 5 ms a frame); past SEED_MAX_TASKS (a 122-task Silverpine
+-- plan: 0.8 -> 2.4 s, and no gain) only the normal start is tried, so the guide keeps up.
+Planner.SEED_MIN_SAVING = 10
+Planner.SEED_MAX_TASKS = 90
+
+local function gateState(tasks)
+    local s = {}
+    for i, t in ipairs(tasks) do s[i] = t.minTurnins or false end
+    return s
+end
+local function setGates(tasks, s)
+    for i, t in ipairs(tasks) do t.minTurnins = s[i] or nil end
+end
+
+--- Returns order, name of the seed that won (nil = the normal start).
+local function solveSeeded(tasks, byId, start, opts)
+    local seeds = opts.seeds
+    if not (seeds and seeds[1]) or #tasks > Planner.SEED_MAX_TASKS then return solveCore(tasks, byId, start, opts) end
+    local before = gateState(tasks)  -- the first guess lowers waits it can't meet; each start begins fresh
+    local order = solveCore(tasks, byId, start, opts)
+    local after = gateState(tasks)
+    local best = Planner.RouteCost(order, start)
+    local won
+    local main = Planner.travelFn
+    for _, seed in ipairs(seeds) do
+        if seed.travel then
+            setGates(tasks, before)
+            Planner.travelFn = seed.travel
+            local alt = solveCore(tasks, byId, start, opts)
+            Planner.travelFn = main
+            -- judged by the first route's waits: another start can't win by lowering them
+            setGates(tasks, after)
+            if #alt == #order and Planner.IsValid(alt, opts) then
+                alt = improve(alt, start, opts)
+                local c = Planner.RouteCost(alt, start)
+                if c < best - Planner.SEED_MIN_SAVING then order, best, won = alt, c, seed.name end
+            end
+        end
+    end
+    return order, won
+end
+
+--- Orders tasks. opts: logCount, logMax, stickyId, predone, turninsBefore, tripRate (XP per
+--- second: new quests that don't earn it for the travel they add are dropped, see pruneTrips),
+--- seeds (other first guesses, see solveSeeded).
+--- Returns order, pruned, seed (name of the first guess that won, nil = the normal one).
+function Planner.Solve(tasks, byId, start, opts)
+    opts = opts or {}
+    local order, seed = solveSeeded(tasks, byId, start, opts)
+    local pruned
+    order, pruned = pruneTrips(order, start, opts)
     if grabPickups(order, start, opts) then order = improve(order, start, opts) end
     order = finishHere(order, start, opts)
     order = pullForward(order, start, opts)
-    return order
+    order = Planner.RushUrgent(order, start, opts)
+    return order, pruned, seed
+end
+
+---------------------------------------------------------------------------
+-- Timed quests first
+---------------------------------------------------------------------------
+-- A timed quest ("bring the Rendered Spores to Apothecary Zamah before the time limit is up")
+-- fails when the clock runs out, so what's left of it goes to the very front of the route,
+-- nearest first, before anything that would only save a little walking. Anything it has to wait
+-- for (a vendor stop its step needs) comes along.
+function Planner.RushUrgent(order, start, opts)
+    local index, rush = {}, {}
+    for _, t in ipairs(order) do index[t.id] = t end
+    local any = false
+    local stack = {}
+    for _, t in ipairs(order) do
+        if t.urgent then rush[t] = true; stack[#stack + 1] = t; any = true end
+    end
+    if not any then return order end
+    while #stack > 0 do
+        local t = table.remove(stack)
+        for _, d in ipairs(t.deps) do
+            local dt = index[d]
+            if dt and not rush[dt] then rush[dt] = true; stack[#stack + 1] = dt end
+        end
+    end
+    local first, rest = {}, {}
+    for _, t in ipairs(order) do
+        if rush[t] then first[#first + 1] = t else rest[#rest + 1] = t end
+    end
+    local seq = greedy(first, nil, start, setmetatable({ ignoreGates = true, stickyId = false }, { __index = opts }))
+    if #seq ~= #first then return order end
+    local candidate = {}
+    for _, t in ipairs(seq) do candidate[#candidate + 1] = t end
+    for _, t in ipairs(rest) do candidate[#candidate + 1] = t end
+    if not Planner.IsValid(candidate, opts) then return order end
+    return candidate
+end
+
+--- Position in the route of the last task of a timed quest (0 = none): hearths, binds and
+--- flight-path detours go after it.
+function Planner.LastUrgent(order)
+    local last = 0
+    for i, t in ipairs(order or {}) do if t.urgent then last = i end end
+    return last
 end
 
 ---------------------------------------------------------------------------
@@ -922,13 +1215,26 @@ end
 function Planner.Plan(ctx)
     Planner.travelFn = ctx.travel
     local tasks, byId = Planner.BuildTasks(ctx)
-    local order = Planner.Solve(tasks, byId, ctx.start, {
+    local order, pruned, seed = Planner.Solve(tasks, byId, ctx.start, {
         logCount = ctx.logCount,
         logMax = ctx.logMax,
         stickyId = ctx.stickyId,
+        tripRate = ctx.tripCheck and ctx.level and Planner.GrindRate(ctx.level) or nil,
+        seeds = ctx.seeds,
     })
     local steps = Planner.GroupSteps(order, ctx.groupRadius)
     local bags = Planner.SimulateBags(steps, ctx.bags or { free = 99, counts = {} }, ctx.reserve, ctx.lookahead)
+    local prunedTasks = 0
+    local prunedQuest = {}
+    for _, p in ipairs(pruned or {}) do prunedQuest[p.questId] = true end
+    for _, t in ipairs(tasks) do
+        if t.questId and prunedQuest[t.questId] then prunedTasks = prunedTasks + 1 end
+    end
+    -- new quests left out, and quests in your log you've outgrown (abandon them for log space)
+    local newOnes, logOnes = {}, {}
+    for _, p in ipairs(pruned or {}) do
+        if p.inLog then logOnes[#logOnes + 1] = p else newOnes[#newOnes + 1] = p end
+    end
     return {
         tasks = tasks,
         byId = byId,
@@ -936,6 +1242,9 @@ function Planner.Plan(ctx)
         steps = steps,
         bags = bags,
         cost = Planner.RouteCost(order, ctx.start),
-        dropped = #tasks - #order,
+        dropped = #tasks - #order - prunedTasks, -- left out for lack of log space
+        pruned = newOnes,                        -- new quests not worth the trip
+        outgrown = logOnes,                      -- quests in your log not worth the trip any more
+        seed = seed,                             -- which first guess the route grew from (nil = normal)
     }
 end

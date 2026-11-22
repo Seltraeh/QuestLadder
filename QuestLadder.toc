@@ -2,7 +2,7 @@
 ## Title: Quest Ladder
 ## Notes: Step-by-step questing guide for WoW: Forever: optimized quest route, "don't forget" hints, bag-space planner and gear upgrades (quest rewards + Auctionator).
 ## Author: Seltraeh
-## Version: 0.3.18
+## Version: 0.4.0
 ## X-License: MIT
 ## X-Website: https://github.com/Seltraeh/QuestLadder
 ## Category: Quests
@@ -22,6 +22,7 @@ Gear.lua
 Bags.lua
 Hints.lua
 Ladder.lua
+Goodies.lua
 Automation.lua
 Highlight.lua
 WorldMarks.lua

@@ -37,6 +37,7 @@ function Data.Init()
     end
     Data.lib = lib
     Data.reason = nil
+    Data.ResetXP()
     return true
 end
 
@@ -46,6 +47,76 @@ function Data.InitWith(fakeLib)
     Data.ready = false
     Data.questCache, Data.pointCache = {}, {}
     return Data.Init()
+end
+
+---------------------------------------------------------------------------
+-- Quest XP: QuestieDB's support data (Classic's table, plus XP observed on Forever for the
+-- new quests), read through `Support.Get("QuestXP").db` = { [questId] = { questLevel, fullXP } }.
+---------------------------------------------------------------------------
+local xpDB, solidXP
+
+function Data.ResetXP() xpDB, solidXP = nil, nil end
+
+local function xpTable()
+    if xpDB == nil then
+        xpDB = false
+        local lib = Data.lib
+        if lib and lib.Support and lib.Support.Get then
+            local ok, mod = pcall(lib.Support.Get, "QuestXP")
+            if ok and type(mod) == "table" and type(mod.db) == "table" then xpDB = mod.db end
+        end
+    end
+    return xpDB or nil
+end
+
+--- A quest's full XP and the quest level it is worth that at, or nil when QuestieDB doesn't know.
+function Data.QuestXP(questId)
+    local db = xpTable()
+    local row = db and db[questId]
+    if type(row) ~= "table" then return nil end
+    local level, xp = tonumber(row[1]), tonumber(row[2])
+    if not (level and xp) then return nil end
+    return xp, level
+end
+
+--- XP the quest gives you at `level` (Classic's rule, as Questie and cmangos compute it): full
+--- until you are 5 levels above it, then 20% less per level, never under 10%.
+function Data.XPAtLevel(xp, questLevel, level)
+    if not (xp and questLevel and level) then return nil end
+    local m = 2 * (questLevel - level) + 20
+    if m < 1 then m = 1 elseif m > 10 then m = 10 end
+    return xp * m / 10
+end
+
+--- What a solid quest at `level` is worth: the 75th percentile of QuestieDB's full quest XP
+--- within 2 levels. (A median wobbled: every level has many tiny "go talk to" quests.)
+function Data.SolidQuestXP(level)
+    if not solidXP then
+        local db = xpTable()
+        if not db then return nil end
+        solidXP = {}
+        local byLevel, maxLevel = {}, 0
+        for _, row in pairs(db) do
+            local lv = type(row) == "table" and tonumber(row[1])
+            local xp = type(row) == "table" and tonumber(row[2])
+            if lv and xp and xp > 0 then
+                byLevel[lv] = byLevel[lv] or {}
+                byLevel[lv][#byLevel[lv] + 1] = xp
+                if lv > maxLevel then maxLevel = lv end
+            end
+        end
+        for lv = 1, maxLevel do
+            local pool = {}
+            for d = -2, 2 do
+                for _, x in ipairs(byLevel[lv + d] or {}) do pool[#pool + 1] = x end
+            end
+            if #pool > 0 then
+                table.sort(pool)
+                solidXP[lv] = pool[math.max(1, math.ceil(#pool * 0.75))]
+            end
+        end
+    end
+    return solidXP[level]
 end
 
 local function num(v) return (type(v) == "number") and v or 0 end
@@ -185,8 +256,29 @@ function Data.GiverPoints(givers)
             names[#names + 1] = Data.ObjectName(objId)
         end
     end
+    -- Quests started by an item you find (Library books, the Cozy Sleeping Bag notes): the
+    -- "giver" is where the item lies. Only items from a few fixed objects, never mob drops, so
+    -- the planner doesn't send you farming for a lucky quest starter.
+    if type(givers[3]) == "table" then
+        for _, itemId in ipairs(givers[3]) do
+            local pts, _, kind, sourceIds = Data.ItemSourcePoints(itemId)
+            if kind == "object" and #pts > 0 and #pts <= Data.FOUND_ITEM_MAX_SPOTS then
+                local itemName = Data.ItemName(itemId)
+                for j = 1, #pts do
+                    local p = {}
+                    for k, v in pairs(pts[j]) do p[k] = v end
+                    p.giverName = itemName or p.giverName
+                    p.giverId = sourceIds[1] and -sourceIds[1] or 0 -- the object, for the "this one" cue
+                    p.foundItem = itemId
+                    points[#points + 1] = p
+                end
+                names[#names + 1] = itemName
+            end
+        end
+    end
     return points, names
 end
+Data.FOUND_ITEM_MAX_SPOTS = 4
 
 ---------------------------------------------------------------------------
 -- Player facts used by availability checks
@@ -298,7 +390,9 @@ Data.vendors = {}
 Data.trainers = {}
 Data.flightMasters = {}
 Data.innkeepers = {}
-Data.transportMasters = {} -- zeppelin and boat masters (not planned with yet; see /ladder diag)
+Data.transportMasters = {} -- zeppelin and boat masters
+Data.bagRewards = {}       -- [questId] = { bag itemId, ... }
+Data.vendorBags = {}       -- { {itemId, vendors = {npcId...}}, ... } plain bags vendors sell
 local TRANSPORT_TITLES = { "zeppelin", "dockmaster", "harbormaster", "boat" }
 
 local function cellKey(wx, wy) return math.floor(wx / CELL) .. ":" .. math.floor(wy / CELL) end
@@ -326,6 +420,7 @@ function Data.BuildIndexes(player, onDone)
         Data.starterGrid, Data.followUps, Data.rewardItems = {}, {}, {}
         Data.gearByLevel, Data.vendors, Data.trainers = {}, {}, {}
         Data.flightMasters, Data.innkeepers, Data.transportMasters = {}, {}, {}
+        Data.bagRewards, Data.vendorBags = {}, {}
 
         -- Quests: starters (spatial) + reverse prerequisites (chains)
         local ids = Q.GetAllIds()
@@ -354,12 +449,23 @@ function Data.BuildIndexes(player, onDone)
             ns.MaybeYield(25)
         end
 
-        -- Items: equippable gear by level, and which quests reward them
+        -- Items: equippable gear by level, and which quests reward them; bags (quest rewards and
+        -- ones vendors sell)
         local itemIds = I.GetAllIds()
         for i = 1, #itemIds do
             local id = itemIds[i]
             local class = num(I.Get(id, "class"))
-            if class == 2 or class == 4 then
+            if class == 1 and num(I.Get(id, "subClass")) == 0 then
+                for _, qid in ipairs(I.Get(id, "questRewards") or {}) do
+                    local list = Data.bagRewards[qid]
+                    if not list then list = {}; Data.bagRewards[qid] = list end
+                    list[#list + 1] = id
+                end
+                local vendors = I.Get(id, "vendors")
+                if type(vendors) == "table" and #vendors > 0 then
+                    Data.vendorBags[#Data.vendorBags + 1] = { itemId = id, vendors = vendors }
+                end
+            elseif class == 2 or class == 4 then
                 local req = num(I.Get(id, "requiredLevel"))
                 local bucket = Data.gearByLevel[req]
                 if not bucket then bucket = {}; Data.gearByLevel[req] = bucket end

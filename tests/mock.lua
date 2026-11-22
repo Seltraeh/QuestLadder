@@ -212,7 +212,8 @@ function M.installGlobals(opts)
             local it = M.items[id]
             if not it then return nil end
             return it.name, "|Hitem:" .. id .. "|h[" .. it.name .. "]|h", it.quality or 1, it.ilvl or 5, it.minLevel or 0,
-                "", "", 1, it.equipLoc or "", 0, it.sell or 0, it.classID or 15, it.subClassID or 0, it.bind or 0
+                "", "", 1, it.equipLoc or "", 0, it.sell or 0, it.classID or 15, it.subClassID or 0, it.bind or 0,
+                0, nil, it.reagent or false -- expansion, set, isCraftingReagent
         end,
         GetItemNameByID = function(id) return M.items[id] and M.items[id].name end,
         GetItemSpell = function(id) return M.items[id] and M.items[id].spell end,
@@ -275,6 +276,11 @@ function M.fakeDB(data)
             classKeys = { WARRIOR = 1, MAGE = 128 },
             npcFlags = { VENDOR = 128, TRAINER = 16, FLIGHT_MASTER = 8, INNKEEPER = 512 },
         },
+        -- QuestieDB's support data: data.questXP = { [questId] = { questLevel, fullXP } }
+        Support = { Get = function(name)
+            if name == "QuestXP" and data.questXP then return { db = data.questXP } end
+            return nil
+        end },
     }
 end
 

@@ -13,12 +13,13 @@ local Geo = ns.Geo
 function QS.Player()
     local _, classFile = UnitClass("player")
     local className = UnitClass("player")
-    local _, _, raceId = UnitRace("player")
+    local _, raceFile, raceId = UnitRace("player")
     local p = {
         level = UnitLevel("player") or 1,
         classFile = classFile,
         className = className,
         raceId = raceId,
+        raceFile = raceFile,
         faction = UnitFactionGroup("player"),
         money = GetMoney and GetMoney() or 0,
         point = Geo.PlayerPoint(),
@@ -181,9 +182,14 @@ function QS.Snapshot()
                 local ok, ready = pcall(C_QuestLog.ReadyForTurnIn, id)
                 if ok and ready then q.complete = true end
             end
+            -- timed quests ("bring the Rendered Spores before the time limit is up"): readAt lets
+            -- the guide count down every second without asking the game again
             if C_QuestLog.GetTimeAllowed then
                 local ok, total, elapsed = pcall(C_QuestLog.GetTimeAllowed, id)
-                if ok and total and total > 0 then q.timer = { total = total, elapsed = elapsed or 0 } end
+                if ok and not ns.AnySecret(total, elapsed) and type(total) == "number" and total > 0 then
+                    q.timer = { total = total, elapsed = tonumber(elapsed) or 0, readAt = GetTime and GetTime() or 0,
+                                source = "api" }
+                end
             end
             if GetQuestLogSpecialItemInfo then
                 local ok, link, _, charges = pcall(GetQuestLogSpecialItemInfo, i)
@@ -194,7 +200,27 @@ function QS.Snapshot()
             byId[id] = q
         end
     end
+    QS.ReadLegacyTimers(list)
     return list, byId
+end
+
+--- The older timer API (GetQuestTimers: seconds left for each timed quest, GetQuestIndexForTimer:
+--- its quest log line), for timed quests GetTimeAllowed didn't report.
+function QS.ReadLegacyTimers(list)
+    if not (GetQuestTimers and GetQuestIndexForTimer) then return end
+    local ok, timers = pcall(function() return { GetQuestTimers() } end)
+    if not ok then return end
+    local now = GetTime and GetTime() or 0
+    for i, left in ipairs(timers) do
+        local okIndex, logIndex = pcall(GetQuestIndexForTimer, i)
+        if okIndex and not ns.AnySecret(left, logIndex) and type(left) == "number" and left > 0 then
+            for _, q in ipairs(list) do
+                if q.logIndex == logIndex and not q.timer then
+                    q.timer = { total = left, elapsed = 0, readAt = now, source = "legacy" }
+                end
+            end
+        end
+    end
 end
 
 function QS.IsComplete(questId)

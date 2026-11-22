@@ -198,12 +198,14 @@ end
 
 local function itemInfo(itemOrLink)
     if not (C_Item and C_Item.GetItemInfo) then return nil end
-    local name, link, quality, ilvl, minLevel, _, _, _, equipLoc, _, sellPrice, classID, subClassID, bindType =
-        C_Item.GetItemInfo(itemOrLink)
+    local name, link, quality, ilvl, minLevel, _, _, _, equipLoc, _, sellPrice, classID, subClassID, bindType,
+          _, _, isCraftingReagent = C_Item.GetItemInfo(itemOrLink)
     if not name then return nil end
     return { name = name, link = link, quality = quality, ilvl = ilvl, minLevel = minLevel or 0,
              equipLoc = equipLoc, sellPrice = sellPrice or 0, classID = classID, subClassID = subClassID,
-             bindType = bindType }
+             bindType = bindType,
+             -- the game's own "Crafting Reagent" flag (used in a profession recipe)
+             craftingReagent = (isCraftingReagent == true and not ns.IsSecret(isCraftingReagent)) or nil }
 end
 Gear.ItemInfo = itemInfo
 
@@ -366,9 +368,17 @@ Gear.UpgradeText = upgradeText
 --- gain first. Only when none does, the one that sells for most.
 function Gear.BestChoice(choices, player)
     if not choices or #choices == 0 then return nil end
-    local best, bestValue
+    local best, bestValue, bestBag
     for _, c in ipairs(choices) do
         local info = itemInfo(c.link or c.itemId)
+        if info and info.classID == 1 and ns.Goodies then
+            -- a bag: more room beats vendor money when nothing here is gear you'd wear
+            local slots = ns.Goodies.BagSlots(c.itemId)
+            if ns.Goodies.IsBagUpgrade(slots) and (not bestBag or slots > bestBag.slots) then
+                bestBag = { index = c.index, itemId = c.itemId, name = info.name, slots = slots,
+                            reason = string.format("more bag space: %d slots", slots) }
+            end
+        end
         if info then
             local up = Gear.CanEquip(c.itemId, info, player, 0) and Gear.CompareToEquipped(c.link or info.link, info, player.classFile, player.level)
             if Gear.IsUpgrade(up) then
@@ -386,6 +396,7 @@ function Gear.BestChoice(choices, player)
             end
         end
     end
+    if bestBag and not (best and best.upgrade) then return bestBag end
     return best
 end
 
@@ -450,14 +461,27 @@ end
 -- Gold budget
 ---------------------------------------------------------------------------
 --- Copper kept back for class training. Auto: roughly what the next few trainer visits cost.
-function Gear.Reserve(level)
+--- Copper kept back: training, plus Apprentice Riding (100g) from level 35 until you can ride
+--- (Paladins and Warlocks get riding from their class mount quest at 40, so not for them).
+Gear.RIDING_COST = 1000000
+Gear.RIDING_SAVE_FROM = 35
+function Gear.NeedsRidingGold(player)
+    if not player or (player.level or 0) < Gear.RIDING_SAVE_FROM then return false end
+    if player.classFile == "PALADIN" or player.classFile == "WARLOCK" then return false end
+    local riding = ns.Travel and ns.Travel.RIDING_SKILL
+    return not (player.skills and riding and player.skills[riding])
+end
+
+function Gear.Reserve(level, player)
     if ns.db.goldReserve then return ns.db.goldReserve end
-    return math.floor(level * level * 35)
+    local copper = math.floor(level * level * 35)
+    if Gear.NeedsRidingGold(player) then copper = copper + Gear.RIDING_COST end
+    return copper
 end
 
 function Gear.Budget(player)
     local money = player.money or (GetMoney and GetMoney()) or 0
-    return math.max(0, money - Gear.Reserve(player.level))
+    return math.max(0, money - Gear.Reserve(player.level, player))
 end
 
 ---------------------------------------------------------------------------

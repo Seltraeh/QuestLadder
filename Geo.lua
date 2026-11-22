@@ -189,8 +189,19 @@ end
 -- Clustering: pick the best "camp" among many spawn points.
 -- Score favours dense groups that are close to the reference point.
 ---------------------------------------------------------------------------
-function Geo.BestCluster(points, ref, radius)
+--- `home` (optional): where the quest is handed in. Mobs that live on two continents (murlocs
+--- in Silverpine and in Darkshore) are hunted on the quest's own continent, and while you're on
+--- the other continent the camp nearest the quest's NPC wins, not the one nearest you.
+function Geo.BestCluster(points, ref, radius, home)
     if not points or #points == 0 then return nil end
+    if home and home.cont ~= nil then
+        local local_ = {}
+        for i = 1, #points do
+            if points[i].cont == home.cont then local_[#local_ + 1] = points[i] end
+        end
+        if #local_ > 0 then points = local_ end
+        if not ref or ref.cont ~= home.cont then ref = home end
+    end
     radius = radius or 90
     local n = #points
     if n == 1 then

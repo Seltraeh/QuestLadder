@@ -121,17 +121,35 @@ local function centroid(objectives)
 end
 
 --- Level of the easiest mob that counts for an objective (kills, or drops from mobs), from
---- QuestieDB's NPC data; nil when no mob is involved.
-local function mobLevelOf(o)
+--- QuestieDB's NPC data; nil when no mob is involved. NPCs friendly to you (`faction`: "Horde"
+--- or "Alliance") aren't fights: "speak to Neeru Fireblade" is a level-37 "monster" objective in
+--- QuestieDB, and it held a level-12 quest back until 37 more quests were turned in.
+local function mobLevelOf(o, faction)
     if o.type ~= "monster" and o.type ~= "item" then return nil end
+    local mine = (faction == "Horde" and "H") or (faction == "Alliance" and "A") or nil
     local best
     for _, id in ipairs((o.targets and o.targets.npc) or {}) do
-        local lv = tonumber(Data.Npc(id, "minLevel"))
+        local friendly = Data.Npc(id, "friendlyToFaction")
+        local talk = friendly == "AH" or (mine ~= nil and friendly == mine)
+        local lv = not talk and tonumber(Data.Npc(id, "minLevel"))
         if lv and lv > 0 and (not best or lv < best) then best = lv end
     end
     return best
 end
 Ladder.MobLevelOf = mobLevelOf
+
+--- Quest text that says there's a clock ("before the time limit is up"): a timed quest even when
+--- the game's timer can't be read.
+local TIMED_PHRASES = { "time limit", "before time runs out", "before the time runs out", "allowed time" }
+function Ladder.TimedByText(db)
+    for _, line in ipairs((db and db.objectivesText) or {}) do
+        local l = type(line) == "string" and line:lower() or ""
+        for _, p in ipairs(TIMED_PHRASES) do
+            if l:find(p, 1, true) then return true end
+        end
+    end
+    return false
+end
 
 local function isEscort(db)
     for _, line in ipairs((db and db.objectivesText) or {}) do
@@ -156,13 +174,15 @@ local function enrichActive(sq, player, pois)
     local counters = {}
     local gameLoc = pois[sq.id] or sq.waypoint
     local anyInstanceOnly = false
+    -- the quest's home: its turn-in NPC nearest you (objectives are looked for on its continent)
+    local home = db and Geo.Nearest((Data.GiverPoints(db.finishedBy)), player.point)
     for _, o in ipairs(sq.objectives) do
         local e = { index = o.index, text = o.text, type = o.type, finished = o.finished, have = o.have, need = o.need }
         local pts, inst, itemId, sourceName, sourceKind, targets = objectivePoints(o, db, counters)
         e.itemId, e.sourceName, e.sourceKind, e.targets = itemId, sourceName, sourceKind, targets
-        e.mobLevel = mobLevelOf(e)
+        e.mobLevel = mobLevelOf(e, player.faction)
         if pts and #pts > 0 then
-            e.loc = Geo.BestCluster(pts, player.point, 90)
+            e.loc = Geo.BestCluster(pts, player.point, 90, home)
         elseif inst then
             e.dungeon = true
             anyInstanceOnly = anyInstanceOnly or not o.finished
@@ -179,6 +199,13 @@ local function enrichActive(sq, player, pois)
     end
     if not q.turnin and sq.complete then q.turnin = gameLoc end
     q.questItems = questItemList(db, q.objectives)
+    -- a timed quest goes first (Planner.RushUrgent) and gets a countdown in the guide
+    q.timer = sq.timer
+    q.timed = sq.timer ~= nil or Ladder.TimedByText(db)
+    if q.timed then
+        -- the item it's about: what the giver handed you (the Rendered Spores), else its first quest item
+        q.timedItem = (db and db.sourceItemId and db.sourceItemId ~= 0) and db.sourceItemId or q.questItems[1]
+    end
     -- No tracked objectives but a usable required item ("use the Symbol of Life to resurrect
     -- Deathguard Falgan"): using it IS the objective, so the turn-in line says so.
     if db and #sq.objectives == 0 and ns.Hints then
@@ -195,7 +222,7 @@ local function enrichActive(sq, player, pois)
     return q
 end
 
-local function dbObjectives(db, ref)
+local function dbObjectives(db, ref, home, faction)
     local out = {}
     local objs = db.objectives or {}
     local idx = 0
@@ -204,8 +231,8 @@ local function dbObjectives(db, ref)
         idx = idx + 1
         local e = { index = idx, type = kind, text = text, finished = false, have = 0, need = 1,
                     itemId = itemId, sourceName = sourceName, sourceKind = sourceKind, targets = targets }
-        e.mobLevel = mobLevelOf(e)
-        if pts and #pts > 0 then e.loc = Geo.BestCluster(pts, ref, 90)
+        e.mobLevel = mobLevelOf(e, faction)
+        if pts and #pts > 0 then e.loc = Geo.BestCluster(pts, ref, 90, home)
         elseif inst then e.dungeon = true; instanceOnly = true end
         out[#out + 1] = e
     end
@@ -248,7 +275,8 @@ end
 local function enrichCandidate(qid, pickupPoint, player)
     local db = Data.Quest(qid)
     if not db then return nil end
-    local objectives, instanceOnly = dbObjectives(db, pickupPoint)
+    local home = Geo.Nearest((Data.GiverPoints(db.finishedBy)), pickupPoint)
+    local objectives, instanceOnly = dbObjectives(db, pickupPoint, home, player and player.faction)
     local c = {
         id = qid, title = db.name, level = db.level, db = db, objectives = objectives,
         pickup = pickupPoint, pickupName = pickupPoint and pickupPoint.giverName,
@@ -269,6 +297,82 @@ local function levelOk(db, player, green, above)
     if (db.reqLevel or 0) > player.level then return false end
     local ql = (db.level and db.level > 0) and db.level or player.level
     return ql >= player.level - green and ql <= player.level + above
+end
+
+---------------------------------------------------------------------------
+-- Quest value: skip quests that give too little for your level
+---------------------------------------------------------------------------
+-- A quest you haven't accepted is only planned when, at your level, it gives at least
+-- minQuestValue (default half) of what a solid quest at your level gives (Data.SolidQuestXP),
+-- or its reward is gear you would wear, or it leads to a quest that is worth it (breadcrumbs,
+-- chain starts), or it's a quest for your class (spells, class items). Quests QuestieDB has no
+-- XP for are kept. Quests in your log are never dropped: abandon one to skip it.
+
+--- What a quest gives you now and how that compares with a solid quest at your level:
+--- returns ratio, xpNow (ratio nil when unknown).
+function Ladder.QuestWorth(questId, level)
+    local xp, questLevel = Data.QuestXP(questId)
+    if not xp then return nil, nil end
+    local now = Data.XPAtLevel(xp, questLevel, level)
+    local solid = Data.SolidQuestXP(level)
+    if not solid or solid <= 0 then return nil, now end
+    return now / solid, now
+end
+
+local function maxPlayerLevel()
+    if GetMaxPlayerLevel then
+        local ok, v = pcall(GetMaxPlayerLevel)
+        if ok and type(v) == "number" and not ns.IsSecret(v) then return v end
+    end
+    return 60
+end
+
+local function rewardsUpgrade(questId, player)
+    local Gear = ns.Gear
+    if not Gear then return false end
+    for _, itemId in ipairs(Data.rewardItems[questId] or {}) do
+        local info = Gear.ItemInfo(itemId)
+        if info and Gear.CanEquip(itemId, info, player, 2) then
+            local up = Gear.CompareToEquipped(info.link, info, player.classFile, player.level)
+            if Gear.IsUpgrade(up) then return true end
+        end
+    end
+    return false
+end
+
+--- Quests that stay in the plan whatever they're worth or wherever they send you: for your class
+--- (spells, class items), Forever's must-do extras, or a reward you'd wear. Returns the reason.
+function Ladder.KeepReason(questId, player)
+    local db = Data.Quest(questId)
+    if db and db.classes and db.classes ~= 0 then return "class" end
+    if ns.Goodies and ns.Goodies.MustDo(questId) then return "goodie" end
+    if rewardsUpgrade(questId, player) then return "upgrade" end
+    return nil
+end
+
+--- Is this not-yet-accepted quest worth planning? Returns ok, ratio, why ("upgrade", "leads on",
+--- "class", "unknown" or nil).
+function Ladder.WorthDoing(questId, player, depth)
+    local min = ns.db.minQuestValue or 0
+    if min <= 0 or player.level >= maxPlayerLevel() then return true end
+    local ratio = Ladder.QuestWorth(questId, player.level)
+    if ratio == nil then return true, nil, "unknown" end
+    if ratio >= min then return true, ratio end
+    local db = Data.Quest(questId)
+    if db and db.classes and db.classes ~= 0 then return true, ratio, "class" end
+    if rewardsUpgrade(questId, player) then return true, ratio, "upgrade" end
+    -- Forever's extras: camping unlocks, Library books, the sleeping bag chain, crates, bag rewards
+    if ns.Goodies and ns.Goodies.MustDo(questId) then return true, ratio, "goodie" end
+    if (depth or 0) < 2 then
+        for _, nextId in ipairs(Data.followUps[questId] or {}) do
+            local nextDb = Data.Quest(nextId)
+            if nextDb and (nextDb.reqLevel or 0) <= player.level + 2 then
+                local ok, _, why = Ladder.WorthDoing(nextId, player, (depth or 0) + 1)
+                if ok and why ~= "unknown" then return true, ratio, "leads on" end
+            end
+        end
+    end
+    return false, ratio
 end
 
 --- Where to look for quests you haven't picked up: around you, and around the places your
@@ -335,13 +439,24 @@ local function buildCandidates(player, activeList, state)
     local green = QS.GreenRange(player.level)
     local near = Ladder.StartersAround(Ladder.SearchAnchors(player, activeList), opts.pickupRadius)
     local checked = 0
+    Ladder.skippedLowValue = {}
+    local whyOf = {}
+    local function worth(qid, db)
+        local ok, ratio, why = Ladder.WorthDoing(qid, player)
+        if not ok and #Ladder.skippedLowValue < 40 then
+            local _, now = Ladder.QuestWorth(qid, player.level)
+            Ladder.skippedLowValue[#Ladder.skippedLowValue + 1] = { id = qid, title = db.name, xp = now, ratio = ratio }
+        end
+        whyOf[qid] = why
+        return ok
+    end
     for _, e in ipairs(near) do
         if #out >= maxC or checked > 250 then break end
         local qid = e.questId
         if not planned[qid] and not ns.charDB.ignored[qid] then
             checked = checked + 1
             local db = Data.Quest(qid)
-            if db and levelOk(db, player, green, opts.levelsAbove) and Data.IsAvailableNow(qid, state) then
+            if db and levelOk(db, player, green, opts.levelsAbove) and Data.IsAvailableNow(qid, state) and worth(qid, db) then
                 local c = enrichCandidate(qid, e.point, player)
                 if c and not (opts.skipDungeonQuests and c.dungeon)
                     and not (opts.skipEscortsAndElites and c.escort) then
@@ -366,7 +481,8 @@ local function buildCandidates(player, activeList, state)
                     for id in pairs(planned) do assume[id] = true end
                     local chainState = setmetatable({ assumeDone = assume }, { __index = state })
                     local db = Data.Quest(fq)
-                    if db and levelOk(db, player, green, opts.levelsAbove + 1) and Data.IsAvailable(fq, chainState) then
+                    if db and levelOk(db, player, green, opts.levelsAbove + 1) and Data.IsAvailable(fq, chainState)
+                        and worth(fq, db) then
                         local from = parent.turnin or parent.pickup or player.point
                         local pts = Data.GiverPoints(db.startedBy)
                         local start = Geo.Nearest(pts, from)
@@ -393,6 +509,112 @@ local function buildCandidates(player, activeList, state)
         frontier = nextFrontier
         ns.MaybeYield(5)
     end
+    for _, c in ipairs(out) do Ladder.SetTripValue(c, whyOf[c.id], player, planned) end
+    return out
+end
+
+--- What a new quest is worth for the "worth the trip" check (Planner.PruneTrips): c.tripXP =
+--- its XP at your level (a solid quest's when QuestieDB doesn't know), plus the best next quest
+--- in its chain when it only "leads on" and that one isn't planned yet. Class quests, gear
+--- upgrades and Forever's must-do quests get c.keep (never dropped for distance).
+function Ladder.SetTripValue(c, why, player, planned)
+    local keep = (why == "class" or why == "upgrade" or why == "goodie") and why or Ladder.KeepReason(c.id, player)
+    c.worthWhy = keep or why
+    if keep then c.keep = true end
+    local _, now = Ladder.QuestWorth(c.id, player.level)
+    local xp = now or Data.SolidQuestXP(player.level)
+    if why == "leads on" then
+        local best = 0
+        for _, nextId in ipairs(Data.followUps[c.id] or {}) do
+            if planned[nextId] then best = 0 break end
+            local _, nextXP = Ladder.QuestWorth(nextId, player.level)
+            if nextXP and nextXP > best then best = nextXP end
+        end
+        xp = (xp or 0) + best
+    end
+    c.tripXP = xp
+end
+
+---------------------------------------------------------------------------
+-- Outgrown quests in your log (0.4.0)
+---------------------------------------------------------------------------
+-- "Once my character gets to a certain level (+3 to 4) above the area's proposed quests, it may
+-- be time to move on from some of my older quests." So a quest in your log OUTGROWN_LEVELS or
+-- more under you joins the "worth the trip" check new quests get (Planner.PruneTrips): it stays
+-- when it's on the way or its XP pays for the walk, and goes (the hint box says to abandon it
+-- for log space) when the route would drag you back to an old zone for it. Classic only cuts
+-- quest XP from 6 levels over, so at +3 most still pay; the check is about the travel. Class
+-- quests, gear upgrades, Forever's must-do quests and timed quests always stay.
+Ladder.OUTGROWN_LEVELS = 3
+
+--- XP a quest in your log gives now: the game's figure, else QuestieDB's at your level.
+local function logQuestXP(questId, level)
+    if GetQuestLogRewardXP then
+        local ok, v = pcall(GetQuestLogRewardXP, questId)
+        if ok and type(v) == "number" and not ns.IsSecret(v) and v > 0 then return v end
+    end
+    local _, now = Ladder.QuestWorth(questId, level)
+    return now or Data.SolidQuestXP(level)
+end
+
+--- Sets q.outgrown and q.tripXP on the quests in your log you've outgrown. `planned` is the set
+--- of quest IDs already in the plan (a follow-up that's planned counts on its own).
+function Ladder.MarkOutgrown(active, player, planned)
+    local level = player.level or 1
+    for _, q in ipairs(active) do
+        q.outgrown, q.tripXP = nil, nil
+        local ql = q.level
+        if type(ql) ~= "number" or ns.IsSecret(ql) or ql <= 0 then
+            local db = Data.Quest(q.id)
+            ql = db and db.level
+        end
+        if type(ql) == "number" and ql > 0 and ql <= level - Ladder.OUTGROWN_LEVELS and not q.timed
+            and not Ladder.KeepReason(q.id, player) then
+            local xp = logQuestXP(q.id, level) or 0
+            -- a chain that leads on to a quest still worth doing carries that quest's XP too
+            local best = 0
+            for _, nextId in ipairs(Data.followUps[q.id] or {}) do
+                if planned and planned[nextId] then best = 0 break end
+                local nextDb = Data.Quest(nextId)
+                if nextDb and (nextDb.reqLevel or 0) <= level + 2 and Ladder.WorthDoing(nextId, player, 1) then
+                    local _, nx = Ladder.QuestWorth(nextId, level)
+                    if nx and nx > best then best = nx end
+                end
+            end
+            q.outgrown, q.tripXP = true, xp + best
+        end
+    end
+end
+
+--- Quests in your log worth dropping when it's full and better ones are around: the ones the
+--- route dropped as outgrown first, then outgrown ones you haven't started, least XP first.
+--- Returns up to `n` { id, title, level, xp, why }.
+function Ladder.WeakestInLog(plan, n)
+    local out, seen = {}, {}
+    for _, p in ipairs((plan and plan.outgrown) or {}) do
+        if #out >= n then break end
+        local q = p.quest or {}
+        out[#out + 1] = { id = p.questId, title = p.title, level = q.level, xp = p.xp, why = "outgrown, off the route" }
+        seen[p.questId] = true
+    end
+    local rest = {}
+    for _, q in ipairs((plan and plan.active) or {}) do
+        if not seen[q.id] and q.outgrown and not q.complete then
+            local started = false
+            for _, o in ipairs(q.objectives or {}) do
+                if o.finished or (type(o.numFulfilled) == "number" and o.numFulfilled > 0) then started = true end
+            end
+            if not started then rest[#rest + 1] = q end
+        end
+    end
+    table.sort(rest, function(a, b)
+        if (a.tripXP or 0) ~= (b.tripXP or 0) then return (a.tripXP or 0) < (b.tripXP or 0) end
+        return a.id < b.id
+    end)
+    for _, q in ipairs(rest) do
+        if #out >= n then break end
+        out[#out + 1] = { id = q.id, title = q.title, level = q.level, xp = q.tripXP, why = "outgrown, not started" }
+    end
     return out
 end
 
@@ -409,6 +631,101 @@ local function availabilityState(player, byId)
         isComplete = QS.IsComplete,
         isActive = function(id) return byId[id] ~= nil end,
     }
+end
+
+Ladder.AvailabilityState = availabilityState -- for tests
+
+---------------------------------------------------------------------------
+-- Next area: where the quests worth doing are, once few are left around you
+---------------------------------------------------------------------------
+Ladder.FEW_GOOD_NEARBY = 5   -- fewer new quests than this near you: look further afield
+Ladder.NEXT_AREA_MIN = 5     -- an area needs at least this many quests worth doing
+
+local function zoneName(mapId)
+    if not (mapId and C_Map and C_Map.GetMapInfo) then return nil end
+    local ok, info = pcall(C_Map.GetMapInfo, mapId)
+    if ok and type(info) == "table" and type(info.name) == "string" and not ns.IsSecret(info.name) then return info.name end
+    return nil
+end
+
+--- The area on your continent (Data's 400-yard starter cells, neighbours counted together) with
+--- the most quests worth doing that you could pick up, beyond the pickup radius. `planned` = quest
+--- IDs already in the plan. Returns { count, zone, giver, point, seconds, mode } or nil.
+function Ladder.NextArea(player, state, planned, net)
+    local cont = player.point and player.point.cont
+    local grid = cont ~= nil and Data.starterGrid[cont]
+    if not grid then return nil end
+    local opts = ns.db
+    local green = QS.GreenRange(player.level)
+    local verdict, cells = {}, {}
+    for key, cell in pairs(grid) do
+        for _, e in ipairs(cell) do
+            local qid = e.questId
+            local good = verdict[qid]
+            if good == nil then
+                good = false
+                if not planned[qid] and not ns.charDB.ignored[qid] then
+                    local db = Data.Quest(qid)
+                    good = db ~= nil and levelOk(db, player, green, opts.levelsAbove)
+                        and Data.IsAvailableNow(qid, state) and (Ladder.WorthDoing(qid, player)) or false
+                end
+                verdict[qid] = good
+            end
+            if good then
+                cells[key] = cells[key] or {}
+                cells[key][qid] = e.point
+            end
+        end
+        ns.MaybeYield(20)
+    end
+    local best
+    for key, quests in pairs(cells) do
+        local cx, cy = key:match("^(-?%d+):(-?%d+)$")
+        cx, cy = tonumber(cx), tonumber(cy)
+        local union, byGiver = {}, {}
+        local n = 0
+        for dx = -1, 1 do
+            for dy = -1, 1 do
+                for qid, p in pairs(cells[(cx + dx) .. ":" .. (cy + dy)] or {}) do
+                    if not union[qid] then
+                        union[qid] = true
+                        n = n + 1
+                        local g = p.giverId or 0
+                        byGiver[g] = byGiver[g] or { count = 0, point = p }
+                        byGiver[g].count = byGiver[g].count + 1
+                    end
+                end
+            end
+        end
+        local rep
+        for _, g in pairs(byGiver) do
+            if not rep or g.count > rep.count then rep = g end
+        end
+        local dist = rep and Geo.Distance(player.point, rep.point)
+        if n >= Ladder.NEXT_AREA_MIN and dist and dist > opts.pickupRadius
+            and (not best or n > best.count or (n == best.count and dist < best.dist)) then
+            best = { count = n, point = rep.point, giver = rep.point.giverName, dist = dist }
+        end
+    end
+    if not best then return nil end
+    best.zone = zoneName(best.point.mapId)
+    if net then
+        local o = ns.Travel.Options(net, player.point, best.point)
+        best.mode = o.pick
+        best.seconds = (o.pick == "fly" and o.fly and o.fly.total) or (o.pick == "zeppelin" and o.zeppelin and o.zeppelin.total) or o.walk
+    end
+    return best
+end
+
+--- "12 quests worth doing in Hillsbrad Foothills (around Magistrate Burnside), ~4:10 by flight"
+function Ladder.NextAreaText(area)
+    local how = ""
+    if area.seconds then
+        local by = (area.mode == "fly" and " by flight") or (area.mode == "zeppelin" and " by zeppelin") or " on foot"
+        how = ", ~" .. Ladder.Clock(area.seconds) .. by
+    end
+    return string.format("%d quests worth doing in %s%s%s", area.count, area.zone or "an area nearby",
+        area.giver and (" (around " .. area.giver .. ")") or "", how)
 end
 
 local function trainerTask(player)
@@ -493,6 +810,12 @@ function Ladder.Rebuild(reason)
         local state = availabilityState(player, byId)
         local candidates = buildCandidates(player, active, state)
         local bags = QS.Bags()
+        local tripCheck = ns.db.tripCheck and player.level < maxPlayerLevel() or nil
+        if tripCheck then
+            local plannedIds = {}
+            for _, c in ipairs(candidates) do plannedIds[c.id] = true end
+            Ladder.MarkOutgrown(active, player, plannedIds)
+        end
 
         local extra = {}
         local trainer = trainerTask(player)
@@ -507,6 +830,15 @@ function Ladder.Rebuild(reason)
         local net = ns.Travel.BuildNetwork(player)
         local walkOnly = function(a, b) return ns.Travel.Walk(net, a, b) end
         local cost = ns.db.useFlights and ns.Travel.NewCost(net) or walkOnly
+        -- Other first guesses for the route (Planner: "More than one first guess"). With walking
+        -- only they'd all be the same route.
+        local seeds
+        if ns.db.useFlights and ns.Travel.HasFlights(net) then
+            seeds = {
+                { name = "flights at full time", travel = ns.Travel.NewCost(net, 1.0) },
+                { name = "walking only", travel = walkOnly },
+            }
+        end
 
         local ctx = {
             travel = cost,
@@ -522,6 +854,9 @@ function Ladder.Rebuild(reason)
             lookahead = ns.db.lookahead,
             stickyId = prevSticky,
             extraTasks = extra,
+            -- new quests must earn their detour (Planner.PruneTrips); XP means nothing at max level
+            tripCheck = tripCheck,
+            seeds = seeds,
         }
         local plan = Planner.Plan(ctx)
 
@@ -551,9 +886,32 @@ function Ladder.Rebuild(reason)
 
         Ladder.AddTravelStops(plan, player, net, cost, bags, ctx.logCount, ctx.logMax)
 
+        -- few quests worth doing left around you (after the ones not worth the trip are out):
+        -- say where the next good area is
+        local nextArea
+        local fresh, planned, prunedId = 0, {}, {}
+        for _, p in ipairs(plan.pruned or {}) do prunedId[p.questId] = true end
+        for _, q in ipairs(active) do planned[q.id] = true end
+        for _, c in ipairs(candidates) do
+            if not prunedId[c.id] then
+                planned[c.id] = true
+                if not c.chainedFrom then fresh = fresh + 1 end
+            end
+        end
+        if Data.ready and fresh < Ladder.FEW_GOOD_NEARBY and ns.db.includeUnstarted then
+            nextArea = Ladder.NextArea(player, state, planned, ns.db.useFlights and net or { nodes = {}, speed = net.speed })
+        end
+
         plan.player = player
         plan.logCount, plan.logMax = ctx.logCount, ctx.logMax
         plan.candidates = candidates
+        plan.nextArea = nextArea
+        plan.skippedLowValue = Ladder.skippedLowValue
+        -- Forever extras worked out once per plan (the hint box reads them every second)
+        if ns.Goodies and Data.ready then
+            plan.bagToBuy = ns.Goodies.BagToBuy(player)
+            plan.cozyStart = ns.Goodies.CozyStart(player, byId, state)
+        end
         plan.active = active
         plan.builtAt = GetTime and GetTime() or 0
         Ladder.plan = plan
@@ -589,11 +947,14 @@ function Ladder.AddTravelStops(plan, player, net, cost, bags, logCount, logMax)
     if not start then return end
     plan.net = net
     local order = plan.order
+    -- a timed quest goes first: no hearth, inn or flight-path detour before it's done
+    local rushUntil = ns.Planner.LastUrgent(order)
 
     -- 1) Hearth-aware route with your current inn (only kept when it really pays off).
     local hearth, why
     if ns.db.useHearth then
-        hearth, why = Travel.HearthAware(order, start, net, cost, { logCount = logCount, logMax = logMax })
+        hearth, why = Travel.HearthAware(order, start, net, cost, { logCount = logCount, logMax = logMax,
+                                                                     minK = rushUntil > 0 and rushUntil or nil })
     end
     plan.hearthWhy = why
 
@@ -610,7 +971,9 @@ function Ladder.AddTravelStops(plan, player, net, cost, bags, logCount, logMax)
                 for i, t in ipairs(order) do pseudo[i] = { loc = t.loc } end
                 local detours = Travel.InsertionDetours(pseudo, start, inn.point, cost, math.floor(#order * 0.6) + 1)
                 local k, detour
-                for i, d in ipairs(detours) do if not detour or d < detour then k, detour = i, d end end
+                for i, d in ipairs(detours) do
+                    if i > rushUntil and (not detour or d < detour) then k, detour = i, d end
+                end
                 if k then
                     local bindTask = { id = "V:bind", kind = "visit", visit = "bind", loc = inn.point, est = 20, deps = {},
                                        npcName = inn.name, npcId = inn.npcId }
@@ -647,8 +1010,15 @@ function Ladder.AddTravelStops(plan, player, net, cost, bags, logCount, logMax)
     if ns.db.discoverFlights then
         local added, taken = 0, {}
         for _ = 1, 2 do
+            local rushStep = 0
+            for i, s in ipairs(plan.steps) do
+                for _, t in ipairs(s.tasks) do if t.urgent then rushStep = i end end
+            end
             local list = Travel.SuggestDiscoveries(plan.steps, start, net, cost, Travel.DISCOVER_MAX_DETOUR, taken)
-            local pick = list[1]
+            local pick
+            for _, p in ipairs(list) do
+                if p.index > rushStep then pick = p break end
+            end
             if not pick then break end
             taken[pick.node] = true
             local task = { id = "V:fp:" .. (pick.node.name or added), kind = "visit", visit = "flight",
@@ -698,6 +1068,171 @@ local function clock(seconds)
     return string.format("%d:%02d", math.floor(seconds / 60), seconds % 60)
 end
 Ladder.Clock = clock
+
+--- /ladder skipped: the new quests the plan leaves out, and why. Returns the lines (for tests).
+function Ladder.SkippedLines(plan)
+    plan = plan or Ladder.plan
+    local lines = {}
+    if not plan then return { "no plan yet" } end
+    local pruned = plan.pruned or {}
+    local level = plan.player and plan.player.level
+    if #pruned > 0 then
+        lines[#lines + 1] = string.format("Not worth the walk from here (%d):", #pruned)
+        for _, p in ipairs(pruned) do
+            local grind = level and ns.Planner.GrindRate(level) * (p.seconds or 0)
+            lines[#lines + 1] = string.format("  %s - %s XP%s, but adds %s of travel (killing mobs that long gives ~%s XP)",
+                tostring(p.title or p.questId), p.xp and tostring(math.floor(p.xp + 0.5)) or "?",
+                (p.together or 1) > 1 and string.format(" (%d quests out there together: %d XP)", p.together,
+                    math.floor((p.groupXP or 0) + 0.5)) or "",
+                clock(p.seconds), grind and tostring(math.floor(grind + 0.5)) or "?")
+        end
+    end
+    local outgrown = plan.outgrown or {}
+    if #outgrown > 0 then
+        lines[#lines + 1] = string.format("Outgrown, in your log but not worth the trip any more (%d) - abandon them to free log space:", #outgrown)
+        for _, p in ipairs(outgrown) do
+            local q = p.quest or {}
+            local grind = level and ns.Planner.GrindRate(level) * (p.seconds or 0)
+            lines[#lines + 1] = string.format("  %s%s - %s XP%s, but %s of travel (killing mobs that long gives ~%s XP)",
+                tostring(p.title or p.questId), q.level and (" [" .. q.level .. "]") or "",
+                p.xp and tostring(math.floor(p.xp + 0.5)) or "?",
+                (p.together or 1) > 1 and string.format(" (%d quests out there together: %d XP)", p.together,
+                    math.floor((p.groupXP or 0) + 0.5)) or "",
+                clock(p.seconds), grind and tostring(math.floor(grind + 0.5)) or "?")
+        end
+    end
+    if plan.logCount and plan.logMax and plan.logCount >= plan.logMax - 1 then
+        local weak = Ladder.WeakestInLog(plan, 5)
+        if #weak > 0 then
+            lines[#lines + 1] = string.format("Your log is %d/%d. Weakest to drop first:", plan.logCount, plan.logMax)
+            for _, w in ipairs(weak) do
+                lines[#lines + 1] = string.format("  %s%s - %s XP, %s", tostring(w.title or w.id), w.level and (" [" .. w.level .. "]") or "",
+                    w.xp and tostring(math.floor(w.xp + 0.5)) or "?", w.why)
+            end
+        end
+    end
+    local low = plan.skippedLowValue or {}
+    if #low > 0 then
+        lines[#lines + 1] = string.format("Too little XP for your level (%d):", #low)
+        for i, s in ipairs(low) do
+            if i > 15 then lines[#lines + 1] = "  ..." break end
+            lines[#lines + 1] = string.format("  %s - %s XP (%s%% of a solid quest)", tostring(s.title or s.id),
+                s.xp and tostring(math.floor(s.xp + 0.5)) or "?", s.ratio and tostring(math.floor(s.ratio * 100 + 0.5)) or "?")
+        end
+    end
+    if #lines == 0 then
+        lines[1] = "nothing skipped: every quest in reach is in the plan"
+    else
+        lines[#lines + 1] = "/ladder trips turns the distance check off, /ladder minxp 0 the XP one."
+    end
+    return lines
+end
+
+--- 0.4.0: take it or leave it, for a quest an NPC offers you (the hint box shows it while the
+--- dialog is open, so you don't have to weigh every quest yourself). Returns take (true/false),
+--- the reason, and the quest's name; nil when there's nothing to say.
+function Ladder.QuestVerdict(questId)
+    if type(questId) ~= "number" or ns.IsSecret(questId) or questId <= 0 then return nil end
+    local plan = Ladder.plan
+    local db = Data.Quest(questId)
+    local title = (db and db.name) or ("quest " .. questId)
+    for i, s in ipairs((plan and plan.steps) or {}) do
+        for _, t in ipairs(s.tasks or {}) do
+            if t.kind == "pickup" and t.questId == questId then
+                return true, string.format("on your route (step %d)", i), title
+            end
+        end
+    end
+    if ns.charDB.ignored[questId] then
+        return false, string.format("you dropped it before (/ladder unignore %d plans it again)", questId), title
+    end
+    if not db then return nil end
+    local player = (plan and plan.player) or QS.Player()
+    local level = player.level or 1
+    local opts = ns.db
+    local ql = (db.level and db.level > 0) and db.level or level
+    if ql > level + (opts.levelsAbove or 2) then
+        return false, string.format("level %d is too high for now (you're %d)", ql, level), title
+    end
+    if ql < level - QS.GreenRange(level) then
+        return false, string.format("grey for you (level %d): next to no XP", ql), title
+    end
+    for _, p in ipairs((plan and plan.pruned) or {}) do
+        if p.questId == questId then
+            return false, string.format("not worth the walk: %s XP for %s of travel", p.xp and tostring(math.floor(p.xp + 0.5)) or "?",
+                clock(p.seconds)), title
+        end
+    end
+    for _, s in ipairs((plan and plan.skippedLowValue) or {}) do
+        if s.id == questId then
+            return false, string.format("too little XP for your level (%s)", s.xp and tostring(math.floor(s.xp + 0.5)) or "?"), title
+        end
+    end
+    if opts.skipDungeonQuests and ns.Goodies and ns.Goodies.IsDungeonQuest(db) then
+        return false, "its objectives are inside a dungeon (/ladder dungeons plan to plan those)", title
+    end
+    if opts.skipEscortsAndElites and isEscort(db) then return false, "an escort or elite quest", title end
+    if plan and plan.logCount and plan.logMax and plan.logCount >= plan.logMax then
+        return false, string.format("your quest log is full (%d/%d) - /ladder outgrown says what to drop", plan.logCount, plan.logMax), title
+    end
+    if Ladder.WorthDoing(questId, player) then
+        return true, "worth its XP but not planned yet: take it and the route adds it", title
+    end
+    return false, "too little XP for your level", title
+end
+
+--- Timed quests in your log, soonest out first: { questId, title, left (seconds, nil when only
+--- the quest text says there's a clock), itemId, to (turn-in NPC), done }. Counts down every
+--- second from when the game's timer was read.
+function Ladder.TimedQuests(now)
+    now = now or (GetTime and GetTime()) or 0
+    local out = {}
+    for _, q in ipairs((Ladder.plan and Ladder.plan.active) or {}) do
+        if q.timed and not q.deferred then
+            local live = Ladder.snapshot and Ladder.snapshot[q.id]
+            if live or not Ladder.snapshot then -- still in your log
+                local timer = (live and live.timer) or q.timer
+                local left = timer and (timer.total - timer.elapsed - (now - (timer.readAt or now))) or nil
+                out[#out + 1] = { questId = q.id, title = q.title, left = left, itemId = q.timedItem,
+                                  to = q.turninName, done = (live and live.complete) or q.complete }
+            end
+        end
+    end
+    table.sort(out, function(a, b) return (a.left or math.huge) < (b.left or math.huge) end)
+    return out
+end
+
+local WATCH = "|TInterface\\Icons\\INV_Misc_PocketWatch_01:14|t "
+Ladder.TIMER_RED_SECONDS = 120
+
+--- "[watch] Timed: Apothecary Zamah - 23:41 left - bring [Rendered Spores] to Apothecary Zamah (it goes first)"
+function Ladder.TimerText(e)
+    local item = e.itemId and (Data.ItemName(e.itemId)
+        or (C_Item and C_Item.GetItemNameByID and select(2, pcall(C_Item.GetItemNameByID, e.itemId))))
+    if type(item) ~= "string" or ns.IsSecret(item) then item = nil end
+    local to = e.to or "the quest giver"
+    local what
+    if e.done then
+        what = item and ("bring |cffffffff[" .. item .. "]|r to " .. to) or ("turn it in to " .. to)
+    else
+        what = "finish it" .. (item and (" (|cffffffff[" .. item .. "]|r)") or "") .. " and turn it in to " .. to
+    end
+    local left
+    if e.left == nil then
+        left = "see the timer in your quest log"
+    elseif e.left <= 0 then
+        left = "|cffff5555time's up|r"
+    else
+        left = ((e.left < Ladder.TIMER_RED_SECONDS) and "|cffff5555" or "|cffffffff") .. clock(e.left) .. "|r left"
+    end
+    return string.format("%s|cffff8800Timed:|r |cffffd200%s|r - %s - %s (it goes first)", WATCH, tostring(e.title), left, what)
+end
+
+function Ladder.PrintSkipped()
+    local lines = Ladder.SkippedLines()
+    ns.Print(lines[1])
+    for i = 2, #lines do print(lines[i]) end
+end
 
 --- A flight worth mentioning next to "walk": not more than twice the walk, or 5 minutes more.
 Ladder.ALT_FLIGHT_MAX_RATIO, Ladder.ALT_FLIGHT_MAX_EXTRA = 2, 300
@@ -878,6 +1413,50 @@ function Ladder.WaypointTarget(step, here)
     return step.loc
 end
 
+--- 0.3.29: a pin somewhere other than the current step, from clicking a hint line (where the
+--- Cozy Sleeping Bag chain starts, a bag vendor, the riding trainer). Same pin as the route's:
+--- the map's own waypoint with its arrow, or a TomTom arrow. The route's pin comes back when you
+--- move on to the next step. Returns true when a pin was placed.
+local extraUid
+function Ladder.PinTo(loc, title)
+    if not (loc and loc.mapId and loc.x and loc.y) then return false end
+    local label = "Quest Ladder: " .. (title or "pin")
+    if TomTom and TomTom.AddWaypoint then
+        if extraUid and TomTom.RemoveWaypoint then pcall(TomTom.RemoveWaypoint, TomTom, extraUid) end
+        local ok, uid = pcall(TomTom.AddWaypoint, TomTom, loc.mapId, loc.x, loc.y,
+            { title = label, persistent = false, minimap = true, world = true, crazy = true })
+        if ok then extraUid = uid end
+        return ok
+    end
+    if not (C_Map and C_Map.SetUserWaypoint and UiMapPoint and UiMapPoint.CreateFromCoordinates) then return false end
+    if C_Map.CanSetUserWaypointOnMap then
+        local okC, can = pcall(C_Map.CanSetUserWaypointOnMap, loc.mapId)
+        if okC and not can then return false end
+    end
+    local okP, point = pcall(UiMapPoint.CreateFromCoordinates, loc.mapId, loc.x, loc.y)
+    if not okP or not point then return false end
+    local ok = pcall(C_Map.SetUserWaypoint, point)
+    if ok and C_SuperTrack and C_SuperTrack.SetSuperTrackedUserWaypoint then
+        pcall(C_SuperTrack.SetSuperTrackedUserWaypoint, true)
+    end
+    return ok
+end
+
+--- Clicking a hint line that names a place: pin it, and say where in chat.
+function Ladder.PinHint(h)
+    local pin = h and h.pin
+    if not pin then return false end
+    local ok = Ladder.PinTo(pin, pin.title)
+    local where = ns.Goodies and ns.Goodies.PlaceText and ns.Goodies.PlaceText(pin)
+    if ok then
+        ns.Print(string.format("map pin placed on %s%s - the route's pin comes back at the next step", pin.title or "the spot",
+            where and (" (" .. where .. ")") or ""))
+    else
+        ns.Print(string.format("couldn't place a map pin there%s", where and (" (" .. where .. ")") or ""))
+    end
+    return ok
+end
+
 function Ladder.UpdateWaypoint()
     if not ns.db.waypoints then return end
     local step = Ladder.CurrentStep()
@@ -908,18 +1487,48 @@ end
 ---------------------------------------------------------------------------
 local VERB = { monster = "Kill", item = "Loot", object = "Use", event = "Go to", reputation = "Reputation" }
 
+--- XP a quest gives you now: the game's figure for quests in your log, else QuestieDB's.
+function Ladder.QuestXPNow(questId)
+    if not questId then return nil end
+    if GetQuestLogRewardXP then -- 0 for quests not in your log: then QuestieDB's figure is used
+        local ok, v = pcall(GetQuestLogRewardXP, questId)
+        if ok and type(v) == "number" and not ns.IsSecret(v) and v > 0 then return v end
+    end
+    local level = (Ladder.plan and Ladder.plan.player and Ladder.plan.player.level) or 1
+    local _, now = Ladder.QuestWorth(questId, level)
+    return now
+end
+
+local function xpText(questId)
+    local xp = Ladder.QuestXPNow(questId)
+    if not xp or xp <= 0 then return "" end
+    return string.format(" |cff888888(+%d XP)|r", math.floor(xp + 0.5))
+end
+
+local function goodieText(questId)
+    local note = ns.Goodies and ns.Goodies.MustDo(questId)
+    return note and (" |cff66ccff[" .. note .. "]|r") or ""
+end
+
 function Ladder.TaskText(t)
     local q = t.quest
     local title = q and (q.title or ("Quest " .. t.questId)) or ""
     if t.kind == "pickup" then
-        return string.format("Accept |cffffd100%s|r%s", title, q.pickupName and (" from " .. q.pickupName) or "")
+        if q.pickup and q.pickup.foundItem then
+            -- a quest that starts from an item lying here (a Library book, a note)
+            return string.format("Pick up |cffffd100%s|r here and right-click it to start |cffffd100%s|r%s%s",
+                q.pickupName or "the item", title, xpText(t.questId), goodieText(t.questId))
+        end
+        return string.format("Accept |cffffd100%s|r%s%s%s", title, q.pickupName and (" from " .. q.pickupName) or "",
+            xpText(t.questId), goodieText(t.questId))
     elseif t.kind == "turnin" then
         local pick = t.rewardPick and (" - pick |cff00ff00" .. t.rewardPick .. "|r") or ""
         if q.useFirst and ns.Hints and ns.Hints.ItemCount(q.useFirst) > 0 then
-            return string.format("Use |cff66ccff[%s]|r%s, then turn in |cffffd100%s|r%s", ns.Hints.ItemName(q.useFirst),
-                q.turninName and (" on " .. q.turninName) or "", title, pick)
+            return string.format("Use |cff66ccff[%s]|r%s, then turn in |cffffd100%s|r%s%s", ns.Hints.ItemName(q.useFirst),
+                q.turninName and (" on " .. q.turninName) or "", title, xpText(t.questId), pick)
         end
-        return string.format("Turn in |cffffd100%s|r%s%s", title, q.turninName and (" to " .. q.turninName) or "", pick)
+        return string.format("Turn in |cffffd100%s|r%s%s%s", title, q.turninName and (" to " .. q.turninName) or "",
+            xpText(t.questId), pick)
     elseif t.kind == "objective" then
         local o = t.obj
         local text = o.text
@@ -1026,10 +1635,58 @@ ns.On("LOGIN", function()
     if C_Timer and C_Timer.After then C_Timer.After(3, start) else start() end
 end)
 
+---------------------------------------------------------------------------
+-- Abandoned quests aren't suggested again
+---------------------------------------------------------------------------
+-- Abandoning is how you skip a quest in your log, but an abandoned quest can be picked up again,
+-- so it came straight back as a new quest to fetch (0.3.25: old quest lines dropped after the
+-- Zamah run). Removed from the log without being turned in = abandoned: it joins the ignored list
+-- (like /ladder skip on a pickup). Not when it had failed (the hint box says to abandon those and
+-- pick them up again). Accept it again and it's planned as usual; /ladder unignore <id> undoes it.
+-- The list is saved with your character, so after Forever's cold-start SavedVariables bug it may
+-- come back empty: then those quests are simply suggested again.
+Ladder.ABANDON_CHECK_DELAY = 1.5
+Ladder.turnedIn = {}
+
+--- A quest left your log. `known` = its last snapshot entry (nil if it wasn't in the log we saw).
+--- Returns true when it was taken as abandoned.
+function Ladder.NoteRemoved(questId, known)
+    if type(questId) ~= "number" or ns.IsSecret(questId) or not known then return false end
+    if Ladder.turnedIn[questId] or known.failed then return false end
+    if C_QuestLog and C_QuestLog.IsQuestFlaggedCompleted then
+        local ok, done = pcall(C_QuestLog.IsQuestFlaggedCompleted, questId)
+        if ok and done == true and not ns.IsSecret(done) then return false end
+    end
+    if ns.charDB.ignored[questId] then return false end
+    ns.charDB.ignored[questId] = true
+    ns.charDB.deferred[questId] = nil
+    ns.Print("abandoned %s: it won't be suggested again (/ladder unignore %d to undo)", tostring(known.title or questId), questId)
+    return true
+end
+
 ns.RegisterEvent("QUEST_LOG_UPDATE", onLogUpdate)
-ns.RegisterEvent("QUEST_ACCEPTED", function() requestReplan("accepted", 1.0) end)
-ns.RegisterEvent("QUEST_TURNED_IN", function() requestReplan("turned in", 1.0) end)
-ns.RegisterEvent("QUEST_REMOVED", function() requestReplan("removed", 1.0) end)
+ns.RegisterEvent("QUEST_ACCEPTED", function(_, a, b)
+    -- Forever/Mainline pass (questId); Classic passed (questLogIndex, questId).
+    local questId = b or a
+    if type(questId) == "number" and not ns.IsSecret(questId) then
+        ns.charDB.ignored[questId] = nil -- picked up again: you want it after all
+        Ladder.turnedIn[questId] = nil
+    end
+    requestReplan("accepted", 1.0)
+end)
+ns.RegisterEvent("QUEST_TURNED_IN", function(_, questId)
+    if type(questId) == "number" and not ns.IsSecret(questId) then Ladder.turnedIn[questId] = true end
+    requestReplan("turned in", 1.0)
+end)
+ns.RegisterEvent("QUEST_REMOVED", function(_, questId)
+    local known = type(questId) == "number" and not ns.IsSecret(questId) and Ladder.snapshot and Ladder.snapshot[questId] or nil
+    if known then
+        -- the turn-in event can come just after the removal: decide a moment later
+        local function decide() if Ladder.NoteRemoved(questId, known) then requestReplan("abandoned", 0.1) end end
+        if C_Timer and C_Timer.After then C_Timer.After(Ladder.ABANDON_CHECK_DELAY, decide) else decide() end
+    end
+    requestReplan("removed", 1.0)
+end)
 ns.RegisterEvent("ZONE_CHANGED_NEW_AREA", function() requestReplan("zone", 2.0) end)
 ns.RegisterEvent("PLAYER_LEVEL_UP", function(_, level)
     -- Classic-style trainers teach new ranks on even levels.
