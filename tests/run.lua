@@ -69,8 +69,8 @@ local function db()
     })
 end
 
-local FILES = { "Core.lua", "Geo.lua", "Data.lua", "QuestState.lua", "Planner.lua", "Travel.lua", "Gear.lua",
-                "Bags.lua", "Hints.lua", "Ladder.lua", "Goodies.lua", "Automation.lua", "Highlight.lua", "WorldMarks.lua" }
+local FILES = { "Core.lua", "Theme.lua", "Geo.lua", "Data.lua", "QuestState.lua", "Planner.lua", "Travel.lua", "Gear.lua",
+                "Bags.lua", "Hints.lua", "Ladder.lua", "Goodies.lua", "Speed.lua", "Automation.lua", "Highlight.lua", "WorldMarks.lua" }
 
 local function setup(opts)
     M.installGlobals(opts)
@@ -980,6 +980,7 @@ do
     local files = {}
     for _, f in ipairs(FILES) do files[#files + 1] = f end
     files[#files + 1] = "UI.lua"
+    files[#files + 1] = "Options.lua"
     local ok, err = pcall(function()
         local ns = M.loadAddon(ADDON_DIR, files)
         ns.Geo.SetZoneMaps({ [12] = 1429 }, {})
@@ -1097,6 +1098,7 @@ do
     local files = {}
     for _, f in ipairs(FILES) do files[#files + 1] = f end
     files[#files + 1] = "UI.lua"
+    files[#files + 1] = "Options.lua"
     files[#files + 1] = "Diag.lua"
     local ns
     local ok, err = pcall(function()
@@ -1161,6 +1163,9 @@ do
         status("errors", "ok")
         status("softtarget", "warn")   -- the event has not fired yet
         status("auctionator", "skip")  -- not installed in the fake client
+        status("options", "fail")      -- the fake client has no Settings API
+        check("diag: options says why", c.options and (c.options.summary or ""):find("no Blizzard Settings API", 1, true)
+            and c.options.data.theme == "cyan" and c.options.data.pages == 5, c.options and c.options.summary)
         check("diag: use button is parented to UIParent", c.usebutton and c.usebutton.data.parentIsUIParent == true
             and c.usebutton.data.type == "item", c.usebutton and c.usebutton.summary)
         check("diag: reward IDs read for the right quest", c.rewards and c.rewards.data.quests[1].choices[1].itemId == 902)
@@ -2003,7 +2008,7 @@ do
     check("candidates: default is 25", ns.defaults.maxCandidates == 25)
     local saved = { maxCandidates = 12 }
     ns.MigrateSettings(saved)
-    check("candidates: a saved old default becomes 25", saved.maxCandidates == 25 and saved.settingsVersion == 1)
+    check("candidates: a saved old default becomes 25", saved.maxCandidates == 25 and saved.settingsVersion == 2)
     saved = { maxCandidates = 8 }
     ns.MigrateSettings(saved)
     check("candidates: a value you chose stays", saved.maxCandidates == 8)
@@ -2503,6 +2508,122 @@ do
     check("pin: TomTom gets the arrow", #added == 2 and added[2][4] == "Quest Ladder: second" and added[2][2] == cozy.point.x)
     check("pin: a second click replaces the first pin only", #removed == 1 and removed[1] == 1, table.concat(removed, ","))
     _G.TomTom = nil
+    -- 0.4.1: on the laptop the pin was on the map with no arrow on screen: the game's In-Game
+    -- Navigation option (CVar showInGameNavigation) hides it. Say so once per session.
+    local told = 0
+    local origPrint2 = ns.Print
+    ns.Print = function(msg) if msg:find("In-Game Navigation setting is off", 1, true) then told = told + 1 end end
+    local navOff = { GetCVar = function(name) if name == "showInGameNavigation" then return "0" end return "1" end }
+    _G.C_CVar = navOff
+    L.toldNoArrow = nil
+    L.current = 1
+    L.UpdateWaypoint()
+    check("arrow: In-Game Navigation off, told when the route's pin goes on the map", told == 1, told)
+    L.PinTo(cozyHint.pin, "again")
+    L.current = 2
+    L.UpdateWaypoint()
+    check("arrow: ...only once per session", told == 1, told)
+    if not ns.Diag then assert(loadfile(ADDON_DIR .. "/Diag.lua"))("QuestLadder", ns) end
+    local wpCheck
+    for _, c in ipairs(ns.Diag.checks) do if c.id == "waypoint" then wpCheck = c end end
+    local okW, wStatus, wSummary, wData = pcall(wpCheck.fn, { step = L.plan.steps[2] })
+    check("arrow: the diag names the option", okW and wStatus == "warn" and wData.inGameNavigation == "0"
+        and tostring(wSummary):find("In-Game Navigation", 1, true), tostring(wStatus) .. ": " .. tostring(wSummary))
+    -- on: nothing said, and the diag is happy
+    _G.C_CVar = { GetCVar = function() return "1" end }
+    L.toldNoArrow, told = nil, 0
+    L.current = 1
+    L.UpdateWaypoint()
+    check("arrow: In-Game Navigation on, nothing said", told == 0, told)
+    okW, wStatus, wSummary = pcall(wpCheck.fn, { step = L.plan.steps[1] })
+    check("arrow: ...and the diag's waypoint check is ok", okW and wStatus == "ok", tostring(wStatus) .. ": " .. tostring(wSummary))
+    -- 0.5.0: Forever has no In-Game Navigation setting, and the arrow went missing with the pin set
+    -- and tracked: the diag records what Blizzard's arrow is doing
+    local realST = _G.C_SuperTrack
+    _G.C_SuperTrack = { SetSuperTrackedUserWaypoint = function() end, IsSuperTrackingUserWaypoint = function() return true end,
+                        GetHighestPrioritySuperTrackingType = function() return 0 end, GetSuperTrackedQuestID = function() return 123 end }
+    okW, wStatus, wSummary = pcall(wpCheck.fn, { step = L.plan.steps[1] })
+    check("arrow: the diag says when the game navigates to a quest instead", okW and wStatus == "warn"
+        and tostring(wSummary):find("navigating to something else (type 0, quest 123)", 1, true), tostring(wSummary))
+    _G.C_SuperTrack.GetHighestPrioritySuperTrackingType = function() return 1 end
+    _G.C_Navigation = { GetFrame = function() return nil end, GetTargetState = function() return 0 end }
+    okW, wStatus, wSummary = pcall(wpCheck.fn, { step = L.plan.steps[1] })
+    check("arrow: ...or makes no navigation frame for the pin", okW and wStatus == "warn"
+        and tostring(wSummary):find("made no navigation frame", 1, true), tostring(wSummary))
+    _G.C_Navigation.GetFrame = function() return {} end
+    _G.SuperTrackedFrame = { IsShown = function() return true end, GetAlpha = function() return 1 end,
+                             Arrow = { IsShown = function() return true end } }
+    local okN, nStatus, nSummary, nData = pcall(wpCheck.fn, { step = L.plan.steps[1] })
+    check("arrow: ...and what the arrow frame shows when it's there", okN and nStatus == "ok"
+        and tostring(nSummary):find("arrow frame true, alpha 1, edge arrow true", 1, true) and nData.nav.shown == true, tostring(nSummary))
+    _G.C_SuperTrack, _G.C_Navigation, _G.SuperTrackedFrame = realST, nil, nil
+    -- 0.5.0: Forever rated a pin 5,300 yd away "Invalid" (state 0) and Blizzard's arrow frame
+    -- draws that see-through, though it was placed and its edge arrow pointed the right way. Quest
+    -- Ladder shows it for its own pins (the user's choice), never for the user's own.
+    local arrowFrame = { alpha = 0 }
+    function arrowFrame:SetAlpha(a) self.alpha = a end
+    function arrowFrame:UpdateAlpha() self:SetAlpha(0) end -- what Blizzard does for an Invalid target
+    _G.SuperTrackedFrame = arrowFrame
+    local realHook, hooks = _G.hooksecurefunc, 0
+    _G.hooksecurefunc = function(t, name, fn)
+        hooks = hooks + 1
+        local orig = t[name]
+        t[name] = function(...) orig(...); fn(...) end
+    end
+    local navState = 0
+    _G.C_Navigation = { GetTargetState = function() return navState end, HasValidScreenPosition = function() return true end }
+    L.arrowHooked = false
+    L.current = 2
+    L.UpdateWaypoint() -- Quest Ladder places its pin
+    arrowFrame:UpdateAlpha()
+    check("arrow: Quest Ladder's pin rated Invalid: the arrow shows", L.arrowHooked and L.ourPinTracked and arrowFrame.alpha == 1,
+        tostring(L.ourPinTracked) .. " " .. tostring(arrowFrame.alpha))
+    navState = 2
+    arrowFrame:UpdateAlpha()
+    check("arrow: in range, Blizzard's own alpha is left alone", arrowFrame.alpha == 0)
+    navState = 0
+    local ours = M.waypoint
+    M.waypoint = { mapId = 1429, x = 0.5, y = 0.5 } -- you place your own pin
+    ns.DispatchEvent("USER_WAYPOINT_UPDATED")
+    arrowFrame:UpdateAlpha()
+    check("arrow: your own pin looks as Blizzard draws it", not L.ourPinTracked and arrowFrame.alpha == 0)
+    M.waypoint = ours
+    ns.DispatchEvent("SUPER_TRACKING_CHANGED")
+    local keepPlan = L.plan
+    _G.SlashCmdList.QUESTLADDER("arrow")
+    L.plan = keepPlan
+    arrowFrame:UpdateAlpha()
+    check("arrow: /ladder arrow turns it off", ns.db.unhideArrow == false and arrowFrame.alpha == 0)
+    _G.SlashCmdList.QUESTLADDER("arrow")
+    L.plan = keepPlan
+    L.HookNavigationArrow()
+    check("arrow: hooked once", hooks == 1 and ns.db.unhideArrow == true, hooks)
+    _G.C_Navigation = { GetTargetState = function() return "secret" end, HasValidScreenPosition = function() return true end }
+    _G.issecretvalue = function(v) return v == "secret" end
+    arrowFrame:UpdateAlpha()
+    check("arrow: a secret state is never compared", arrowFrame.alpha == 0)
+    _G.issecretvalue = function() return false end
+    _G.hooksecurefunc, _G.C_Navigation, _G.SuperTrackedFrame = realHook, nil, nil
+    L.current = 1
+    L.UpdateWaypoint()
+    -- TomTom draws its own arrow, so the option doesn't matter there
+    _G.C_CVar = navOff
+    _G.TomTom = { AddWaypoint = function() return 1 end, RemoveWaypoint = function() end }
+    L.current = 2
+    L.UpdateWaypoint()
+    L.PinTo(cozyHint.pin, "tomtom")
+    check("arrow: with TomTom, nothing said", told == 0, told)
+    _G.TomTom = nil
+    -- the game's answer is read safely: an error, no C_CVar at all, a value we can't read
+    _G.C_CVar = { GetCVar = function() error("no such CVar") end }
+    check("arrow: a CVar error counts as on", L.InGameNavigationOff() == false)
+    _G.C_CVar = nil
+    check("arrow: no CVar API counts as on", L.InGameNavigationOff() == false)
+    _G.C_CVar = { GetCVar = function() return nil end }
+    check("arrow: an unknown CVar counts as on", L.InGameNavigationOff() == false)
+    _G.C_CVar = nil
+    ns.Print = origPrint2
+    L.toldNoArrow = nil
     -- the other hints that name a place get one too
     local buyHint = hintWith({ player = player, bagToBuy = buy }, "More bag space:")
     check("pin: the bag vendor", buyHint and buyHint.pin and buyHint.pin.title == "Bag Vendor" and buy.point
@@ -3368,6 +3489,946 @@ do
 end
 
 ---------------------------------------------------------------------------
+-- 15o. 0.5.0: speed-leveling techniques (the user asked to fold in what a Classic speed-leveling
+-- guide does: grind to catch up before leaving, die on purpose to travel, watch for named mobs
+-- whose drop starts a quest, break while the hearth cools down, learn Cooking for an XP quest,
+-- skip escorts and group quests that aren't worth it). Rules on QuestieDB data, no guide content.
+---------------------------------------------------------------------------
+do
+    -- escorts: their walking time counts in the "worth the walk" check
+    local ns = setup()
+    local P, L, S = ns.Planner, ns.Ladder, ns.Speed
+    local function pt(x, y) return { cont = 0, wx = x, wy = y, mapId = 1, x = 0, y = 0 } end
+    local hub = pt(0, 0)
+    local function walk(a, b) return math.sqrt((a.wx - b.wx) ^ 2 + (a.wy - b.wy) ^ 2) / 7 end
+    local function cand(id, title, xp, extra)
+        return { id = id, title = title, pickup = hub, turnin = hub, tripXP = xp, extraSeconds = extra,
+                 objectives = { { index = 1, type = "event", need = 1, have = 0, finished = false, loc = pt(20, 0) } } }
+    end
+    local plan = P.Plan({ start = hub, level = 17, tripCheck = true, logCount = 0, logMax = 40, travel = walk, active = {},
+        candidates = { cand(1001, "Slow Escort", 300, S.ESCORT_SECONDS), cand(1002, "Rich Escort", 2500, S.ESCORT_SECONDS),
+                       cand(1003, "Next Door Errand", 300, nil) } })
+    local pruned, inOrder = {}, {}
+    for _, p in ipairs(plan.pruned) do pruned[p.questId] = p end
+    for _, t in ipairs(plan.order) do inOrder[t.questId or -1] = true end
+    check("escort: four minutes of walking for 300 XP isn't worth it", pruned[1001] and not inOrder[1001] and pruned[1001].extra == 240,
+        pruned[1001] and pruned[1001].extra)
+    check("escort: one worth its time stays", inOrder[1002] and not pruned[1002])
+    check("escort: a cheap errand on the way still stays", inOrder[1003] and not pruned[1003])
+    check("escort: /ladder skipped says it's the escorting", L.TripTimeText(pruned[1001] or {}):find("4:00 of escorting", 1, true),
+        L.TripTimeText(pruned[1001] or {}))
+    check("escort: travel and escorting together", L.TripTimeText({ seconds = 310, extra = 240 }) == "1:10 of travel and 4:00 of escorting")
+    check("escort: plain travel reads as before", L.TripTimeText({ seconds = 600 }) == "10:00 of travel")
+end
+
+do
+    -- group quests, profession unlocks and "watch for" through the whole pipeline
+    local ns = setup()
+    local D, L, S, H = ns.Data, ns.Ladder, ns.Speed, ns.Hints
+    local function q(name, level, extra)
+        local t = { name = name, startedBy = { { 1200 } }, finishedBy = { { 1200 } }, requiredLevel = 1, questLevel = level }
+        for k, v in pairs(extra or {}) do t[k] = v end
+        return t
+    end
+    D.InitWith(M.fakeDB({
+        quests = {
+            [1101] = q("Arachnophobia", 21, { objectives = { { { 1201 } } } }),
+            [1102] = q("Wolves", 20, { objectives = { { { 1202 } } } }),
+            [1103] = q("Old Elite", 20, { objectives = { { { 1203 } } } }),
+            [1104] = q("Elite Bounty For Your Class", 21, { objectives = { { { 1201 } } }, requiredClasses = 1 }),
+            [1110] = q("Soothing Turtle Bisque", 20, { objectives = {}, requiredSkill = { 185, 1 } }),
+            [1111] = q("Gourmet Only", 20, { objectives = {}, requiredSkill = { 185, 50 } }),
+            [1112] = q("Miners Only", 20, { objectives = {}, requiredSkill = { 186, 1 } }),
+            [1121] = { name = "Owatanka", startedBy = { nil, nil, { 1120 } }, finishedBy = { { 1200 } }, requiredLevel = 20,
+                       questLevel = 22, objectives = {} },
+            [1123] = { name = "Far Away Named", startedBy = { nil, nil, { 1122 } }, finishedBy = { { 1200 } }, requiredLevel = 20,
+                       questLevel = 22, objectives = {} },
+            [1125] = { name = "Lucky Letter", startedBy = { nil, nil, { 1124 } }, finishedBy = { { 1200 } }, requiredLevel = 20,
+                       questLevel = 22, objectives = {} },
+        },
+        questXP = { [1101] = { 21, 1600 }, [1102] = { 20, 1500 }, [1103] = { 20, 1500 }, [1104] = { 21, 300 },
+                    [1110] = { 20, 1500 }, [1111] = { 20, 1500 }, [1112] = { 20, 1500 },
+                    [1121] = { 22, 1700 }, [1123] = { 22, 1700 }, [1125] = { 22, 1700 } },
+        npcs = {
+            [1200] = { name = "Hub Giver", spawns = spawn(42, 41) },
+            [1201] = { name = "Besseleth", minLevel = 21, maxLevel = 21, rank = 1, spawns = spawn(45, 41) },
+            [1202] = { name = "Grey Wolf", minLevel = 20, maxLevel = 21, spawns = spawn(46, 42) },
+            [1203] = { name = "Old Ogre", minLevel = 15, maxLevel = 15, rank = 1, spawns = spawn(44, 43) },
+            [1205] = { name = "Ayessa Dawnsinger", minLevel = 9999, rank = 1, spawns = spawn(44, 44) },
+            [1210] = { name = "Cook Craggle", subName = "Cooking Trainer", npcFlags = 16, spawns = spawn(43, 40) },
+            [1220] = { name = "Owatanka", minLevel = 23, maxLevel = 23, zoneID = 12 },
+            [1222] = { name = "Far Named", minLevel = 22, maxLevel = 22, spawns = { [40] = { { 90, 90 } } } },
+            [1231] = { name = "Ghoul A", minLevel = 21 }, [1232] = { name = "Ghoul B", minLevel = 21 },
+            [1233] = { name = "Ghoul C", minLevel = 21 }, [1234] = { name = "Ghoul D", minLevel = 21 },
+        },
+        objects = {},
+        items = {
+            [1120] = { name = "Owatanka's Tailspike", startQuest = 1121, npcDrops = { 1220 }, class = 12 },
+            [1122] = { name = "Far Trophy", startQuest = 1123, npcDrops = { 1222 }, class = 12 },
+            [1124] = { name = "Bloodstained Letter", startQuest = 1125, npcDrops = { 1231, 1232, 1233, 1234 }, class = 12 },
+        },
+    }))
+    M.player.level = 20
+    local plan = fullPlan(ns)
+    local cands = {}
+    for _, c in ipairs((plan and plan.candidates) or {}) do cands[c.id] = c end
+    local group = {}
+    for _, s in ipairs((plan and plan.skippedGroup) or {}) do group[s.id] = s end
+    check("group: a quest against an elite at your level is left out solo", not cands[1101] and group[1101]
+        and group[1101].mob == "Besseleth" and group[1101].level == 21)
+    check("group: an ordinary one is planned", cands[1102] ~= nil)
+    check("group: an elite well under you is soloable", cands[1103] ~= nil and not group[1103])
+    check("group: Forever's placeholder level 9999 isn't a real elite", S.EliteTarget({ type = "monster", targets = { npc = { 1205 } } }, 20, "Horde") == nil)
+    check("group: a real one is", S.EliteTarget({ type = "monster", targets = { npc = { 1201 } } }, 20, "Horde") == "Besseleth")
+    check("group: a class quest against an elite stays", cands[1104] ~= nil and not group[1104])
+    local take, why = L.QuestVerdict(1101)
+    check("group: the dialog says it needs a group", take == false and tostring(why):find("needs a group: Besseleth (lvl 21) is elite", 1, true), why)
+    local lines = table.concat(L.SkippedLines(plan), "\n")
+    check("group: /ladder skipped lists it", lines:find("Needs a group (1)", 1, true) and lines:find("Arachnophobia - Besseleth (lvl 21) is elite", 1, true), lines)
+    -- the class quest's objective is shown as an elite
+    local eliteText
+    for _, t in ipairs(plan.order) do
+        if t.kind == "objective" and t.questId == 1104 then eliteText = L.TaskText(t) end
+    end
+    check("group: an elite objective says so", eliteText and eliteText:find("lvl 21 elite", 1, true), eliteText)
+    _G.SlashCmdList.QUESTLADDER("groupquests")
+    check("group: /ladder groupquests plans them", ns.db.skipGroupQuests == false)
+    L.Rebuild("group on")
+    local planned = false
+    for _, c in ipairs(L.plan.candidates) do if c.id == 1101 then planned = true end end
+    check("group: ...and then it's in the plan", planned and #L.plan.skippedGroup == 0)
+    _G.SlashCmdList.QUESTLADDER("groupquests")
+    L.Rebuild("group off")
+    plan = L.plan
+
+    -- a profession you can learn in a minute unlocks a quest
+    local u = plan.skillUnlocks and plan.skillUnlocks[1]
+    check("profession: Cooking unlocks Soothing Turtle Bisque", u and u.questId == 1110 and u.skill == "Cooking" and #plan.skillUnlocks == 1,
+        u and u.questId)
+    check("profession: the quest isn't planned before you learn it", not cands[1110])
+    local function hint(p, needle, step)
+        for _, h in ipairs(H.Compute({ plan = p, step = step, byId = {}, bags = ns.QuestState.Bags(), now = M.time,
+                                       point = ns.Geo.PlayerPoint() })) do
+            if h.text:find(needle, 1, true) then return h end
+        end
+    end
+    local lh = hint(plan, "Learn Cooking:")
+    check("profession: the hint names the trainer, the quest and its XP", lh and lh.text:find("Cook Craggle", 1, true)
+        and lh.text:find("Soothing Turtle Bisque", 1, true) and lh.text:find("+1500 XP", 1, true), lh and lh.text)
+    check("profession: ...and clicks to a map pin on the trainer", lh and lh.pin and lh.pin.title == "Cook Craggle")
+    _G.C_SkillInfo = { GetNumSkillLines = function() return 1 end,
+                       GetSkillLineInfo = function() return { skillID = 185, rank = 1 } end }
+    L.Rebuild("learned cooking")
+    local nowPlanned = false
+    for _, c in ipairs(L.plan.candidates) do if c.id == 1110 then nowPlanned = true end end
+    check("profession: once learned, the quest is planned and the hint goes", nowPlanned and #L.plan.skillUnlocks == 0)
+    _G.C_SkillInfo = nil
+    L.Rebuild("back")
+    plan = L.plan
+
+    -- named mobs whose drop starts a quest
+    local w = plan.watchFor or {}
+    check("watch for: Owatanka, whose drop starts a quest, in the zone you're in", w[1] and w[1].npcName == "Owatanka"
+        and w[1].questId == 1121 and w[1].step == 0, w[1] and w[1].npcName)
+    check("watch for: not a named mob nowhere near the route, nor a lucky drop off common mobs", #w == 1, #w)
+    check("watch for: only drops from 3 mobs or fewer are indexed", #D.questDrops == 2, #D.questDrops)
+    local wh = hint(plan, "Watch for:")
+    check("watch for: the hint says what it starts and how to check", wh and wh.text:find("Owatanka (lvl 23) around here", 1, true)
+        and wh.text:find("/tar Owatanka", 1, true) and wh.text:find("+1700 XP", 1, true), wh and wh.text)
+    ns.WorldMarks.SetTargets(plan.steps[1])
+    check("watch for: its nameplate gets a box", ns.WorldMarks.npc[1220] == "Quest drop")
+    M.bag = { { id = 1120 } }
+    L.Rebuild("tailspike looted")
+    check("watch for: not once the item is in your bags", #(L.plan.watchFor or {}) == 0)
+    M.bag = {}
+end
+
+do
+    -- hearth on cooldown: a good moment for a break
+    local ns = setup()
+    local H = ns.Hints
+    M.bag = { { id = 6948 } }
+    local step = { travel = { mode = "hearth", bindName = "Razor Hill", saving = 400 }, loc = ns.Geo.Point(1429, 0.9, 0.9), tasks = {} }
+    local function hint(needle)
+        for _, h in ipairs(H.Compute({ plan = { player = ns.QuestState.Player(), steps = { step } }, step = step, byId = {},
+                                       bags = ns.QuestState.Bags(), now = M.time, point = ns.Geo.PlayerPoint() })) do
+            if h.text:find(needle, 1, true) then return h end
+        end
+    end
+    M.hearthCD = { 900, 1800 } -- 28:20 left
+    local b = hint("Hearth ready in")
+    check("hearth: on a long cooldown, take a break", b and b.text:find("28:20", 1, true)
+        and b.text:find("keeps ticking while you're logged out", 1, true), b and b.text)
+    M.time = 5000
+    M.hearthCD = { 5000 - 1740, 1800 } -- a minute left
+    local s = hint("Hearth ready in")
+    check("hearth: a minute left: just the countdown", s and s.text:find("1:00", 1, true) and not s.text:find("break", 1, true), s and s.text)
+    M.time = 1000
+    M.hearthCD = { 0, 0 }
+    check("hearth: ready: hearth now", hint("Hearth now") ~= nil and hint("Hearth ready in") == nil)
+    M.bag = {}
+end
+
+do
+    -- grind first: the plan runs short of turn-ins before mobs that would be too high
+    local ns = setup()
+    local D, L, S = ns.Data, ns.Ladder, ns.Speed
+    D.InitWith(M.fakeDB({
+        quests = {
+            [1301] = { name = "Raptor Heads", startedBy = { { 1300 } }, finishedBy = { { 1300 } }, requiredLevel = 18, questLevel = 22,
+                       objectives = { { { 1302 } } } },
+        },
+        questXP = { [1301] = { 22, 1800 } },
+        npcs = {
+            [1300] = { name = "Hub Giver", spawns = spawn(42, 41) },
+            [1302] = { name = "Witchwing Raptor", minLevel = 24, maxLevel = 24, spawns = spawn(60, 60) },
+            [1303] = { name = "Bristleback Quilboar", minLevel = 19, maxLevel = 20, spawns = { [12] = { { 43, 42 }, { 43.5, 42 }, { 44, 42.5 } } } },
+            [1304] = { name = "Lone Boar", minLevel = 20, maxLevel = 20, spawns = spawn(44, 44) },
+            [1305] = { name = "Kodo Too High", minLevel = 30, maxLevel = 31, spawns = spawn(43, 41) },
+        },
+        objects = {}, items = {},
+    }))
+    M.player.level = 20
+    local plan = fullPlan(ns)
+    local stop = plan and plan.grindStop
+    check("grind: a stop goes in before the raptors (lvl 24 at level 20, nothing else to turn in)", stop ~= nil)
+    local grindAt, raptorsAt
+    for i, s in ipairs(plan.steps) do
+        for _, t in ipairs(s.tasks) do
+            if t.visit == "grind" then grindAt = i end
+            if t.kind == "objective" and t.questId == 1301 and not raptorsAt then raptorsAt = i end
+        end
+    end
+    check("grind: ...right before them", grindAt and raptorsAt and grindAt == raptorsAt - 1, tostring(grindAt) .. "/" .. tostring(raptorsAt))
+    check("grind: on the densest mobs at your level near where you leave from", stop and stop.mobName == "Bristleback Quilboar"
+        and stop.npcIds and stop.npcIds[1] == 1303, stop and stop.mobName)
+    check("grind: at most 15 minutes, a few bars", stop and stop.est <= S.GRIND_MAX_SECONDS + 0.5 and stop.targetLevel > 20.25
+        and stop.targetLevel < 21, stop and stop.targetLevel)
+    check("grind: the step says what, where, how long and why", stop and stop.label:find("Grind first: kill Bristleback Quilboar (lvl 19-20)", 1, true)
+        and stop.label:find("bars into level 20", 1, true) and stop.label:find("Witchwing Raptor ahead is level 24", 1, true), stop and stop.label)
+    -- the step is done when the bar gets there, and it's skippable like the other stops
+    L.current = grindAt
+    ns.WorldMarks.SetTargets(plan.steps[grindAt])
+    check("grind: the mobs to grind get a box", ns.WorldMarks.npc[1303] == "Grind")
+    check("grind: not done yet at the start of the level", not L.TaskDone(stop, {}))
+    _G.UnitXP, _G.UnitXPMax = function() return 23000 end, function() return 23200 end
+    check("grind: done once the bar gets there", L.TaskDone(stop, {}))
+    check("grind: level with the bar", math.abs(S.LevelNow() - (20 + 23000 / 23200)) < 1e-6)
+    _G.UnitXP, _G.UnitXPMax = nil, nil
+    check("grind: level text", S.LevelText(23) == "level 23" and S.LevelText(22.3) == "6 bars into level 22"
+        and S.LevelText(22.99) == "level 23" and S.LevelText(22.05) == "1 bar into level 22")
+    -- off: no stop
+    _G.SlashCmdList.QUESTLADDER("grind")
+    L.Rebuild("grind off")
+    check("grind: /ladder grind turns it off", ns.db.grindFirst == false and L.plan.grindStop == nil)
+    _G.SlashCmdList.QUESTLADDER("grind")
+    -- nothing to grind for when the mobs are at your level
+    local synthetic = { steps = { { tasks = { { kind = "objective", mobLevel = 21, quest = {}, obj = {} } } } } }
+    check("grind: no stop when the mobs are at most one above you", S.GrindStop(synthetic, { level = 20, xpFrac = 0, point = ns.Geo.PlayerPoint() }) == nil)
+    -- turn-ins on the way count: three turn-ins first can be enough
+    local P = ns.Planner
+    local turnins = {}
+    for i = 1, 8 do turnins[i] = { kind = "turnin", xpWeight = 1 } end
+    local enough = { steps = { { tasks = turnins }, { tasks = { { kind = "objective", mobLevel = 22, quest = {}, obj = {} } } } } }
+    check("grind: turn-ins before the fight count", S.GrindStop(enough, { level = 20, xpFrac = 0.2, point = ns.Geo.PlayerPoint() }) == nil,
+        P.TurninsPerLevel(20))
+end
+
+do
+    -- die and res at the spirit healer
+    local ns = setup()
+    local L, S, H = ns.Ladder, ns.Speed, ns.Hints
+    _G.C_DeathInfo = { GetGraveyardsForMap = function() return { { name = "Razor Hill", position = { x = 0.80, y = 0.41 } } } end }
+    S.ResetGraveyards()
+    local dest = ns.Geo.Point(1429, 0.81, 0.41) -- 30 yd past the graveyard, 1170 yd from you
+    local nextFight = ns.Geo.Point(1429, 0.82, 0.45)
+    local function planAt(level)
+        local p = { player = { level = level }, net = { nodes = {}, speed = 7 },
+                    steps = { { index = 1, loc = dest, est = 30, tasks = { { kind = "turnin", questId = 1 } } },
+                              { index = 2, loc = nextFight, est = 200,
+                                tasks = { { kind = "objective", obj = { type = "monster" } } } } } }
+        L.plan, L.current = p, 1
+        return p
+    end
+    local here = ns.Geo.PlayerPoint()
+    local p = planAt(8)
+    local live = L.LiveTravel(p.steps[1], here)
+    check("die: level 8, the graveyard by your next stop: quicker than a 2:47 walk", live and live.die and live.die.name == "Razor Hill"
+        and live.die.sickness == 0 and math.abs(live.dieVs - 1170 / 7) < 1, live and live.die and live.die.total)
+    local function hint(needle)
+        for _, h in ipairs(H.Compute({ plan = L.plan, step = L.plan.steps[1], byId = {}, bags = ns.QuestState.Bags(), now = M.time,
+                                       point = here })) do
+            if h.text:find(needle, 1, true) then return h end
+        end
+    end
+    local dh = hint("Faster: die on purpose")
+    check("die: the hint names the graveyard, both times and the cost", dh and dh.text:find("graveyard by Razor Hill, 30 yd", 1, true)
+        and dh.text:find("no res sickness up to level 10", 1, true) and dh.text:find("25% durability", 1, true), dh and dh.text)
+    planAt(15)
+    live = L.LiveTravel(L.plan.steps[1], here)
+    check("die: level 15 with a fight right after: 5 minutes of sickness, not worth it", live and not live.die)
+    check("die: res sickness by level", S.ResSicknessSeconds(10) == 0 and S.ResSicknessSeconds(15) == 300 and S.ResSicknessSeconds(40) == 600)
+    -- turn-ins and a long walk after: the sickness wears off on the way
+    local calm = { player = { level = 15 }, net = { nodes = {}, speed = 7 },
+                   steps = { { index = 1, loc = dest, est = 30, tasks = { { kind = "turnin" } } },
+                             { index = 2, loc = ns.Geo.Point(1429, 0.81, 0.95), est = 20, tasks = { { kind = "pickup" } } },
+                             { index = 3, loc = ns.Geo.Point(1429, 0.10, 0.95), est = 20, tasks = { { kind = "turnin" } } } } }
+    check("die: calm time counts turn-ins and the walks between them", S.CalmSeconds(calm, 1, calm.net) > 300, S.CalmSeconds(calm, 1, calm.net))
+    L.plan = calm
+    live = L.LiveTravel(calm.steps[1], here)
+    check("die: ...so at level 15 it's worth it again", live and live.die and live.die.wait == 0)
+    -- a short trip: not worth dying for
+    planAt(8)
+    local near = ns.Geo.Point(1429, 0.45, 0.41)
+    L.plan.steps[1].loc = near
+    live = L.LiveTravel(L.plan.steps[1], here)
+    check("die: not for a short walk", live and not live.die)
+    L.plan.steps[1].loc = dest
+    local mine = L.plan
+    _G.SlashCmdList.QUESTLADDER("dietravel") -- (it replans: put the test's route back)
+    L.plan = mine
+    live = L.LiveTravel(L.plan.steps[1], here)
+    check("die: /ladder dietravel turns the tip off", ns.db.deathTravel == false and live and not live.die)
+    _G.SlashCmdList.QUESTLADDER("dietravel")
+    L.plan = mine
+    -- no graveyard from the game: the ones you've appeared at count
+    _G.C_DeathInfo = nil
+    S.ResetGraveyards()
+    live = L.LiveTravel(L.plan.steps[1], here)
+    check("die: without the game's graveyard list, nothing to suggest", live and not live.die)
+    M.player.x, M.player.y = 0.79, 0.42
+    _G.UnitIsGhost = function() return true end
+    _G.GetSubZoneText = function() return "Razor Hill" end
+    ns.DispatchEvent("PLAYER_ALIVE")
+    check("die: released at a graveyard: it's remembered", #S.LearnedGraveyards() == 1 and S.LearnedGraveyards()[1].gyName == "Razor Hill")
+    ns.DispatchEvent("PLAYER_ALIVE")
+    check("die: ...once", #S.LearnedGraveyards() == 1)
+    M.player.x, M.player.y = 0.42, 0.41
+    live = L.LiveTravel(L.plan.steps[1], here)
+    check("die: and then it's suggested", live and live.die and live.die.name == "Razor Hill")
+    _G.UnitIsGhost, _G.GetSubZoneText = nil, nil
+    -- the game's list can hold secret values: never used
+    _G.C_DeathInfo = { GetGraveyardsForMap = function() return { { name = "X", position = { x = "secret", y = 0.4 } } } end }
+    _G.issecretvalue = function(v) return v == "secret" end
+    S.ResetGraveyards()
+    check("die: a secret position is skipped", #S.GameGraveyards(1429) == 0)
+    _G.issecretvalue = function() return false end
+    _G.C_DeathInfo = nil
+    L.plan = nil
+end
+
+---------------------------------------------------------------------------
+-- 15p. 0.6.0: make it yours - themes and colors, compact mode, window options, map squares,
+--      the options window, the minimap's add-on menu and the icon
+---------------------------------------------------------------------------
+do
+    M.installGlobals({ frames = true })
+    M.player = { level = 3, classFile = "WARRIOR", className = "Warrior", money = 25000, mapId = 1429, x = 0.42, y = 0.41 }
+    M.log, M.completed, M.rewards, M.bag, M.equipped = {}, {}, {}, {}, {}
+    M.items = M.items or {}
+    local placed = { mini = 0, world = 0 }
+    local pinsLib = {
+        RemoveAllMinimapIcons = function() end, RemoveAllWorldMapIcons = function() end,
+        AddMinimapIconMap = function() placed.mini = placed.mini + 1 end,
+        AddWorldMapIconMap = function() placed.world = placed.world + 1 end,
+    }
+    _G.LibStub = setmetatable({}, { __call = function(_, name) if name:find("^HereBeDragons") then return pinsLib, 7 end end })
+    local sounds = 0
+    _G.SOUNDKIT = { MAP_PING = 1 }
+    _G.PlaySound = function() sounds = sounds + 1 end
+    _G.Settings, _G.ColorPickerFrame, _G.AddonCompartmentFrame = nil, nil, nil
+    local files = {}
+    for _, f in ipairs(FILES) do files[#files + 1] = f end
+    files[#files + 1] = "UI.lua"
+    files[#files + 1] = "Options.lua"
+    local ns
+    local ok, err = pcall(function()
+        ns = M.loadAddon(ADDON_DIR, files)
+        ns.Geo.SetZoneMaps({ [12] = 1429 }, {})
+        ns.Geo.SetTransform(1429, { cont = 0, ox = 0, oy = 0, ax = 3000, ay = 0, bx = 0, by = 2000 })
+        ns.Data.InitWith(db())
+        ns.Fire("SETTINGS_LOADED")
+        M.log = { { id = 2, title = "Kobold Camp Cleanup", level = 2, complete = false,
+                    objectives = { { text = "Kobold Vermin slain: 2/6", type = "monster", finished = false, numFulfilled = 2, numRequired = 6 } } } }
+        ns.Data.BuildIndexes(ns.QuestState.Player(), function() end)
+        local function drive()
+            for _, f in ipairs(M.frames) do
+                local s = f.__scripts and f.__scripts.OnUpdate
+                if s then for _ = 1, 500 do s(f, 0.016) end end
+            end
+        end
+        drive()
+        ns.Ladder.Rebuild("0.6.0 test")
+        drive()
+    end)
+    check("0.6.0: loads with the options file", ok, err)
+    if ok then
+        local T, UI, O, HL, WM = ns.Theme, ns.UI, ns.Options, ns.Highlight, ns.WorldMarks
+        local guide, hf = _G.QuestLadderGuideFrame, _G.QuestLadderHintFrame
+        local fired = {}
+        for _, msg in ipairs({ "THEME_CHANGED", "REQUEST_REPLAN", "OPEN_OPTIONS" }) do
+            ns.On(msg, function() fired[msg] = (fired[msg] or 0) + 1 end)
+        end
+
+        -- Themes and colors
+        local r, g, b = T.Color("marker")
+        check("theme: cyan by default, the look Quest Ladder always had", T.Preset().key == "cyan" and r == 0 and g == 1 and b == 1
+            and T.Hex("accent") == "|cff33ff99", T.Hex("accent"))
+        local v0 = T.version
+        check("theme: switching to pink", T.SetPreset("pink") and ns.db.theme == "pink" and T.version == v0 + 1
+            and fired.THEME_CHANGED == 1)
+        r, g, b = T.Color("marker")
+        check("theme: pink markers", r == 1 and g == 0.41 and b == 0.71 and T.Hex("marker") == "|cffff69b5", T.Hex("marker"))
+        T.SetColor("marker", 0.5, 0.25, 1)
+        r, g, b = T.Color("marker")
+        check("theme: your own color on top of the theme", T.IsCustom("marker") and r == 0.5 and g == 0.25 and b == 1)
+        check("theme: other colors stay the theme's", not T.IsCustom("map") and select(1, T.Color("map")) == 1)
+        T.ResetColor("marker")
+        check("theme: right-click puts the theme's color back", not T.IsCustom("marker") and select(2, T.Color("marker")) == 0.41)
+        T.SetColor("map", 0.1, 0.2, 0.3)
+        T.SetPreset("gold")
+        check("theme: a new theme drops your picks", not T.IsCustom("map") and select(2, T.Color("map")) == 0.75)
+        ns.db.colors = { marker = { 2, "x", 1 }, map = "junk" }
+        r, g, b = T.Color("marker")
+        check("theme: a broken saved color falls back to the theme", r == 1 and g == 0.82 and b == 0 and not T.IsCustom("marker"))
+        ns.db.theme = "no such theme"
+        check("theme: an unknown saved theme falls back to cyan", T.Preset().key == "cyan" and select(1, T.Color("marker")) == 0)
+        check("theme: found by name or key", T.Find("fel").key == "green" and T.Find("PINK").key == "pink"
+            and T.Find(" frost ").key == "frost" and T.Find("nope") == nil and T.Find("") == nil)
+        check("theme: refuses junk colors", not T.SetColor("marker", nil, 1, 1))
+        _G.SlashCmdList.QUESTLADDER("theme pink")
+        check("slash: /ladder theme pink", ns.db.theme == "pink", ns.db.theme)
+        _G.SlashCmdList.QUESTLADDER("theme")
+        check("slash: /ladder theme lists them, marking the one in use", (M.lastPrint or ""):find("themes:", 1, true)
+            and (M.lastPrint or ""):find("[|cffff69b5pink|r]", 1, true), M.lastPrint)
+        check("chat: lines start with the icon and the name in the theme's color",
+            (M.lastPrint or ""):find("Media\\Icon", 1, true) and (M.lastPrint or ""):find(T.Hex("accent") .. "Quest Ladder", 1, true),
+            M.lastPrint)
+
+        -- Saved settings: map squares got their own switches, reset keeps learned data
+        local saved = ns.ApplyDefaults({ worldMarks = false, settingsVersion = 1 }, ns.defaults)
+        ns.MigrateSettings(saved)
+        check("settings: world marks off keeps the squares off too", saved.minimapSquares == false and saved.worldMapSquares == false
+            and saved.settingsVersion == 2)
+        saved = ns.ApplyDefaults({ worldMarks = true, settingsVersion = 1 }, ns.defaults)
+        ns.MigrateSettings(saved)
+        check("settings: world marks on leaves the squares on", saved.minimapSquares == true and saved.worldMapSquares == true)
+        saved = ns.ApplyDefaults({ worldMarks = false, settingsVersion = 2, minimapSquares = true }, ns.defaults)
+        ns.MigrateSettings(saved)
+        check("settings: squares turned on after the update stay on", saved.minimapSquares == true)
+        saved = { compact = true, theme = "pink", colors = { marker = { 1, 0, 0 } }, guideWidth = 400, weights = { agi = 2 },
+                  goldReserve = 500, graveyards = { { name = "Kept" } }, settingsVersion = 2 }
+        ns.ResetSettings(saved)
+        check("settings: reset puts defaults back", saved.compact == false and saved.theme == "cyan" and next(saved.colors) == nil
+            and saved.guideWidth == 340 and saved.weights == nil and saved.goldReserve == nil)
+        check("settings: reset keeps what was learned", saved.graveyards and saved.graveyards[1].name == "Kept"
+            and saved.settingsVersion == 2)
+        check("settings: reset gives its own colors table", saved.colors ~= ns.defaults.colors)
+
+        -- Boxes: color, thickness, labels, pulse
+        T.SetPreset("cyan")
+        local target = M.newFrame("target"); target:Show()
+        local box = HL.Box("t", target, "Use", 2)
+        check("boxes: painted with the theme", box and box.paintedVersion == T.version and #box.edges == 4)
+        T.SetPreset("pink")
+        check("boxes: repainted when the theme changes", box.paintedVersion == T.version)
+        ns.db.markerLabels = false
+        HL.Box("t", target, "Use", 2)
+        check("boxes: labels can be switched off", box.label:GetText() == "")
+        ns.db.markerLabels = true
+        HL.Box("t", target, "Use", 2)
+        check("boxes: ...and on", box.label:GetText() == "Use")
+        check("boxes: fade by default", box.pulsing == true)
+        ns.db.markerPulse = false
+        HL.Box("t", target, "Use", 2)
+        check("boxes: fading can be switched off", box.pulsing == false)
+        ns.db.markerPulse = true
+        ns.db.markerThickness = 9
+        check("boxes: thickness stays 1-4", HL.Thickness() == 4 and HL.NeedsPaint(box))
+        HL.Box("t", target, "Use", 2)
+        check("boxes: a new thickness repaints", box.paintedThickness == 4 and box.pulsing == true)
+        ns.db.markerThickness = 0
+        check("boxes: ...at least 1", HL.Thickness() == 1)
+        ns.db.markerThickness = 2
+        HL.Clear("t")
+
+        -- Nameplate markers and the "This one" cue use the marker color; the ping can be muted
+        local lines = {}
+        WM.softHit, WM.targetHit = { label = "Use", name = "Crate" }, { label = "Kill", name = "Wolf" }
+        WM.Hints(function(h) lines[#lines + 1] = h.text end)
+        check("cues: \"This one\" and \"Target is right\" in the marker color", lines[1]:find(T.Hex("marker"), 1, true)
+            and lines[2]:find(T.Hex("marker"), 1, true) and not lines[1]:find("00ffff", 1, true), lines[1])
+        WM.softHit, WM.targetHit = nil, nil
+        WM.object[77] = "Use"
+        M.guids.softinteract = "GameObject-0-1-2-3-77-0"
+        ns.DispatchEvent("PLAYER_SOFT_INTERACT_CHANGED", nil, M.guids.softinteract)
+        check("cues: a ping when you face the object", sounds == 1, sounds)
+        ns.DispatchEvent("PLAYER_SOFT_INTERACT_CHANGED", nil, nil)
+        ns.db.pingSound = false
+        ns.DispatchEvent("PLAYER_SOFT_INTERACT_CHANGED", nil, M.guids.softinteract)
+        check("cues: no ping when it's switched off", sounds == 1, sounds)
+        ns.db.pingSound = true
+        M.guids.softinteract = nil
+        ns.DispatchEvent("PLAYER_SOFT_INTERACT_CHANGED", nil, nil)
+
+        -- Map squares: each map has its own switch
+        local step = { tasks = { { kind = "objective", isDone = false,
+                                   loc = { mapId = 1429, x = 0.5, y = 0.5, members = { { mapId = 1429, x = 0.5, y = 0.5 },
+                                                                                       { mapId = 1429, x = 0.6, y = 0.5 } } } } } }
+        placed.mini, placed.world = 0, 0
+        WM.RefreshPins(step)
+        check("squares: on both maps by default", placed.mini == 2 and placed.world == 2 and WM.pinsShown.minimap == 2)
+        ns.db.minimapSquares = false
+        placed.mini, placed.world = 0, 0
+        WM.RefreshPins(step)
+        check("squares: the minimap's can be switched off alone", placed.mini == 0 and placed.world == 2, placed.mini)
+        ns.db.worldMapSquares = false
+        placed.mini, placed.world = 0, 0
+        WM.RefreshPins(step)
+        check("squares: ...and the world map's", placed.mini == 0 and placed.world == 0 and WM.PinCount() == 0)
+        ns.db.minimapSquares, ns.db.worldMapSquares = true, true
+        ns.db.worldMarks = false
+        placed.mini = 0
+        WM.RefreshPins(step)
+        check("squares: nameplate markers off doesn't hide them any more", placed.mini == 2)
+        ns.db.worldMarks = true
+        ns.db.squareSize = 10
+        local mini, world = WM.SquareSizes()
+        check("squares: size from the options, world map 2 bigger", mini == 10 and world == 12)
+        ns.db.squareSize = 99
+        check("squares: size stays sensible", (WM.SquareSizes()) == 16)
+        ns.db.squareSize = 7
+
+        -- Guide window: compact mode, buttons, footer lines, width, lock, hint lines
+        UI.RefreshGuide()
+        check("window: full mode shows the buttons and the -", guide.skipBtn:IsShown() and guide.gearBtn:IsShown()
+            and guide.compactBtn:GetText() == "-")
+        check("window: the icon is in the title bar", guide.icon ~= nil and guide.icon.tex ~= nil)
+        local before = fired.REQUEST_REPLAN or 0
+        _G.SlashCmdList.QUESTLADDER("compact")
+        check("compact: /ladder compact turns it on without a replan", ns.db.compact == true and (fired.REQUEST_REPLAN or 0) == before)
+        local limits = UI.Limits()
+        check("compact: fewer lines, no buttons, no footer", limits.compact and limits.tasks == 3 and limits.next == 1
+            and limits.hints == 2 and not limits.buttons and not limits.bagLine and not limits.gearLine)
+        check("compact: the window follows", not guide.skipBtn:IsShown() and not guide.bagsBtn:IsShown()
+            and not guide.footer:IsShown() and guide.compactBtn:GetText() == "+")
+        ns.db.compactTaskLines = 1
+        UI.RefreshGuide()
+        check("compact: one line for the current step", guide.tasks[1]:IsShown() and not guide.tasks[2]:IsShown())
+        local stepNow = ns.Ladder.CurrentStep()
+        if stepNow and #stepNow.tasks > 1 then
+            check("compact: the line says how many more there are", (guide.tasks[1]:GetText() or ""):find("more)", 1, true) ~= nil,
+                guide.tasks[1]:GetText())
+        end
+        ns.db.compactNextSteps = 0
+        UI.RefreshGuide()
+        check("compact: no upcoming steps when set to 0", not guide.nextLabel:IsShown() and not guide.next[1]:IsShown())
+        ns.db.compactTaskLines, ns.db.compactNextSteps = 3, 1
+        UI.ToggleCompact()
+        check("compact: the -/+ button turns it off again", ns.db.compact == false and guide.skipBtn:IsShown())
+        ns.db.showButtons, ns.db.showBagLine, ns.db.showGearLine = false, false, false
+        UI.RefreshGuide()
+        check("window: buttons and footer lines can be switched off", not guide.skipBtn:IsShown() and not guide.footer:IsShown()
+            and not guide.footer2:IsShown())
+        ns.db.showButtons, ns.db.showBagLine, ns.db.showGearLine = true, true, true
+        ns.db.guideWidth = 9999
+        check("window: width stays on screen", UI.Width() == UI.MAX_WIDTH)
+        ns.db.guideWidth = "junk"
+        check("window: a broken width falls back", UI.Width() == 340)
+        ns.db.guideWidth = 340
+        ns.db.nextStepsShown = 99
+        check("window: upcoming steps stay 0-6", UI.Limits().next == 6)
+        ns.db.nextStepsShown = 4
+        local moved = false
+        guide.StartMoving = function() moved = true end
+        ns.db.lockGuide = true
+        guide.__scripts.OnDragStart(guide)
+        check("window: locked, it doesn't move", not moved)
+        ns.db.lockGuide = false
+        guide.__scripts.OnDragStart(guide)
+        check("window: unlocked, it does", moved)
+        ns.charDB.frame = { point = "TOP", x = 5, y = 5 }
+        UI.ResetPosition()
+        check("window: reset position forgets where it was", next(ns.charDB.frame) == nil)
+        ns.Hints.list = { { text = "first", kind = "info" }, { text = "second", kind = "info" } }
+        ns.db.hintLines = 1
+        UI.RefreshHints()
+        check("hints: the box shows as many lines as set", hf.lines[1]:IsShown() and not hf.lines[2]:IsShown())
+        ns.db.hintLines = 4
+        UI.RefreshHints()
+        check("hints: ...or all of them", hf.lines[2]:IsShown())
+        ns.Hints.list = {}
+
+        -- The options window
+        check("options: no Settings API, nothing registered", O.Register() == false and O.reason == "no Settings API")
+        M.lastPrint = nil
+        O.Open()
+        check("options: says so when it can't open", (M.lastPrint or ""):find("couldn't open", 1, true), M.lastPrint)
+        local reg = { subs = {}, added = 0 }
+        _G.Settings = {
+            RegisterCanvasLayoutCategory = function(frame, name)
+                reg.main, reg.name = frame, name
+                return { GetID = function() return 77 end }
+            end,
+            RegisterCanvasLayoutSubcategory = function(_, frame, name) reg.subs[#reg.subs + 1] = name; return {} end,
+            RegisterAddOnCategory = function() reg.added = reg.added + 1 end,
+            OpenToCategory = function(id) reg.opened = id end,
+        }
+        check("options: registers with Blizzard's options", O.Register() == true and reg.added == 1 and #reg.subs == 4
+            and O.CategoryId() == 77, #reg.subs)
+        check("options: the name in the list has the icon after it (keeps A-Z order)",
+            reg.name:find("^Quest Ladder") and reg.name:find("Media\\Icon", 1, true), reg.name)
+        check("options: registers once", O.Register() == true and reg.added == 1)
+        _G.SlashCmdList.QUESTLADDER("options")
+        check("options: /ladder options opens it", reg.opened == 77 and fired.OPEN_OPTIONS == 1)
+        reg.opened = nil
+        M.inCombat = true
+        O.Open()
+        check("options: not in combat", reg.opened == nil and O.openAfterCombat == true)
+        M.inCombat = false
+        ns.DispatchEvent("PLAYER_REGEN_ENABLED")
+        check("options: ...it opens when the fight is over", reg.opened == 77 and not O.openAfterCombat)
+
+        -- every page builds, and its controls change the settings
+        local controls = {}
+        for i, frame in ipairs(O.frames) do
+            local okB, errB = pcall(function() frame.__scripts.OnShow(frame) end)
+            check("options: page " .. i .. " (" .. frame.def.name .. ") builds", okB and frame.built and #frame.controls > 0, errB)
+            for _, c in ipairs(frame.controls or {}) do
+                local key = c.item and c.item.key or c.preset or c.role
+                if key then controls[(c.item and c.item.kind or "x") .. ":" .. key] = controls[(c.item and c.item.kind or "x") .. ":" .. key] or c end
+                if c.preset then controls["theme:" .. c.preset] = c end
+                if c.role then controls["color:" .. c.role] = c end
+            end
+        end
+        check("options: every page is listed", #O.frames == #O.PAGES and #O.PAGES == 5)
+        local cb = controls["check:compact"]
+        cb.GetChecked = function() return true end
+        cb.__scripts.OnClick(cb)
+        check("options: a checkbox changes the setting", ns.db.compact == true)
+        cb.GetChecked = function() return false end
+        cb.__scripts.OnClick(cb)
+        ns.db.skipGroupQuests = true
+        local group = controls["check:skipGroupQuests"]
+        local checked
+        group.SetChecked = function(_, v) checked = v end
+        group:Refresh()
+        check("options: \"Plan group quests\" shows the opposite of skipping them", checked == false)
+        before = fired.REQUEST_REPLAN or 0
+        group.GetChecked = function() return true end
+        group.__scripts.OnClick(group)
+        check("options: ...and ticking it plans them, with a replan", ns.db.skipGroupQuests == false
+            and (fired.REQUEST_REPLAN or 0) == before + 1)
+        ns.db.skipGroupQuests = true
+        before = fired.REQUEST_REPLAN or 0
+        local mm = controls["check:minimapSquares"]
+        mm.GetChecked = function() return false end
+        mm.__scripts.OnClick(mm)
+        check("options: display switches don't replan", ns.db.minimapSquares == false and (fired.REQUEST_REPLAN or 0) == before)
+        ns.db.minimapSquares = true
+        local width = controls["slider:guideWidth"]
+        width.__scripts.OnValueChanged(width, 433)
+        check("options: sliders snap to their step", ns.db.guideWidth == 430, ns.db.guideWidth)
+        width.__scripts.OnValueChanged(width, 2000)
+        check("options: ...and stay in range", ns.db.guideWidth == 520, ns.db.guideWidth)
+        ns.db.guideWidth = 340
+        local minxp = controls["slider:minQuestValue"]
+        minxp.__scripts.OnValueChanged(minxp, 0.333)
+        check("options: percent sliders too", ns.db.minQuestValue == 0.35, ns.db.minQuestValue)
+        ns.db.minQuestValue = 0.5
+        local pink = controls["theme:pink"]
+        T.SetPreset("cyan")
+        pink.__scripts.OnClick(pink)
+        check("options: a theme button switches the theme", ns.db.theme == "pink")
+        local swatch = controls["color:marker"]
+        swatch.__scripts.OnClick(swatch, "LeftButton")
+        check("options: no color picker, says so", (M.lastPrint or ""):find("color picker", 1, true), M.lastPrint)
+        local shownInfo
+        _G.ColorPickerFrame = {
+            SetupColorPickerAndShow = function(_, info) shownInfo = info end,
+            GetColorRGB = function() return 0.2, 0.4, 0.6 end,
+        }
+        swatch.__scripts.OnClick(swatch, "LeftButton")
+        check("options: a color opens Blizzard's picker with the current color", shownInfo and shownInfo.r == 1 and shownInfo.g == 0.41)
+        shownInfo.swatchFunc()
+        r, g, b = T.Color("marker")
+        check("options: picking shows the color at once", T.IsCustom("marker") and r == 0.2 and g == 0.4 and b == 0.6)
+        shownInfo.cancelFunc()
+        check("options: Cancel puts the theme's color back", not T.IsCustom("marker"))
+        T.SetColor("marker", 0.9, 0.9, 0.9)
+        swatch.__scripts.OnClick(swatch, "LeftButton")
+        shownInfo.swatchFunc()
+        shownInfo.cancelFunc()
+        check("options: ...or your earlier pick", T.IsCustom("marker") and select(1, T.Color("marker")) == 0.9)
+        swatch.__scripts.OnClick(swatch, "RightButton")
+        check("options: right-click a color for the theme's", not T.IsCustom("marker"))
+        ns.db.compact, ns.db.guideScale = true, 1.4
+        O.ResetAll()
+        check("options: reset all", ns.db.compact == false and ns.db.guideScale == 1 and ns.db.theme == "cyan")
+
+        -- The minimap's add-on menu
+        local showing = ns.db.showGuide
+        QuestLadder_OnAddonCompartmentClick("QuestLadder", "RightButton")
+        check("add-on menu: right-click shows or hides the guide", ns.db.showGuide == not showing)
+        ns.db.showGuide = true
+        reg.opened = nil
+        QuestLadder_OnAddonCompartmentClick("QuestLadder", "LeftButton")
+        check("add-on menu: click opens the options", reg.opened == 77)
+        local okTip = pcall(QuestLadder_OnAddonCompartmentEnter, "QuestLadder", M.newFrame("menuButton"))
+        check("add-on menu: tooltip", okTip and pcall(QuestLadder_OnAddonCompartmentLeave))
+        check("add-on menu: not in a client without it", O.InAddonMenu() == nil)
+        _G.AddonCompartmentFrame = { registeredAddons = { { text = "Questie" }, { text = "Quest Ladder" } } }
+        check("add-on menu: found when listed", O.InAddonMenu() == true)
+        _G.AddonCompartmentFrame.registeredAddons = { { text = "Questie" } }
+        check("add-on menu: ...and when not", O.InAddonMenu() == false)
+        _G.AddonCompartmentFrame = nil
+        _G.Settings, _G.ColorPickerFrame = nil, nil
+    end
+    _G.SOUNDKIT, _G.PlaySound, _G.LibStub = nil, nil, nil
+end
+
+---------------------------------------------------------------------------
+-- 15q. The icon: game-ready textures, named in the TOC, global functions for the add-on menu
+---------------------------------------------------------------------------
+do
+    local function tga(path)
+        local f = io.open(ADDON_DIR .. "/" .. path, "rb")
+        if not f then return nil end
+        local head = f:read(18)
+        local size = f:seek("end")
+        f:close()
+        if not head or #head < 18 then return nil end
+        local w = head:byte(13) + head:byte(14) * 256
+        local h = head:byte(15) + head:byte(16) * 256
+        return { imageType = head:byte(3), width = w, height = h, bits = head:byte(17), size = size }
+    end
+    local function pow2(n)
+        local p = 1
+        while p < n do p = p * 2 end
+        return n > 0 and p == n
+    end
+    for _, name in ipairs({ "Media/Icon.tga", "Media/Logo.tga" }) do
+        local t = tga(name)
+        check("icon: " .. name .. " is an uncompressed 32-bit TGA, power-of-two square",
+            t and t.imageType == 2 and t.bits == 32 and t.width == t.height and pow2(t.width)
+            and t.size >= 18 + t.width * t.height * 4, t and (t.width .. "x" .. t.height .. " type " .. t.imageType))
+    end
+    local f = assert(io.open(ADDON_DIR .. "/QuestLadder.toc", "r"))
+    local toc = f:read("*a")
+    f:close()
+    check("icon: the TOC's icon is Media\\Icon", toc:find("## IconTexture: Interface\\AddOns\\QuestLadder\\Media\\Icon\n", 1, true) ~= nil)
+    local ns = M.loadAddon(ADDON_DIR, FILES)
+    check("icon: Theme names the same files", ns.Theme.ICON == "Interface\\AddOns\\QuestLadder\\Media\\Icon"
+        and ns.Theme.LOGO == "Interface\\AddOns\\QuestLadder\\Media\\Logo")
+    M.installGlobals({ frames = true })
+    local files = {}
+    for _, x in ipairs(FILES) do files[#files + 1] = x end
+    files[#files + 1] = "UI.lua"
+    files[#files + 1] = "Options.lua"
+    M.loadAddon(ADDON_DIR, files)
+    for name in toc:gmatch("## AddonCompartmentFunc%w*: (%S+)") do
+        check("icon: add-on menu function " .. name .. " exists", type(_G[name]) == "function")
+    end
+    local bf = assert(io.open(ADDON_DIR .. "/Bindings.xml", "r"))
+    local bindings = bf:read("*a")
+    bf:close()
+    for fn in bindings:gmatch("(QuestLadder_%w+)%(%)") do
+        check("bindings: " .. fn .. " exists", type(_G[fn]) == "function")
+    end
+    for name in bindings:gmatch('name="(QUESTLADDER_%w+)"') do
+        check("bindings: " .. name .. " has a label", type(_G["BINDING_NAME_" .. name]) == "string")
+    end
+end
+
+---------------------------------------------------------------------------
+-- 15r. 0.6.0: every /ladder command is in the options too; "Having trouble?": reload,
+--      diagnostics (then an offer to reload), the report window; gold and stat weights
+---------------------------------------------------------------------------
+do
+    M.installGlobals({ frames = true })
+    M.player = { level = 3, classFile = "WARRIOR", className = "Warrior", money = 25000, mapId = 1429, x = 0.42, y = 0.41 }
+    M.log, M.completed, M.rewards, M.bag, M.equipped = {}, {}, {}, {}, {}
+    M.items = M.items or {}
+    local reloads, popups = 0, {}
+    _G.ReloadUI = function() reloads = reloads + 1 end
+    _G.StaticPopupDialogs = {}
+    _G.StaticPopup_Show = function(name, text) popups[#popups + 1] = { name = name, text = text } end
+    _G.GetBuildInfo = function() return "1.60.1", "71037", "Nov 20 2026", 16001 end
+    _G.GetZoneText = function() return "Elwynn Forest" end
+    _G.QuestLadderDiag = nil
+    _G.Settings = {
+        RegisterCanvasLayoutCategory = function() return { GetID = function() return 5 end } end,
+        RegisterCanvasLayoutSubcategory = function() return {} end,
+        RegisterAddOnCategory = function() end,
+        OpenToCategory = function() end,
+    }
+    local files = {}
+    for _, f in ipairs(FILES) do files[#files + 1] = f end
+    files[#files + 1] = "UI.lua"
+    files[#files + 1] = "Options.lua"
+    files[#files + 1] = "Diag.lua"
+    local ns
+    local ok, err = pcall(function()
+        ns = M.loadAddon(ADDON_DIR, files)
+        ns.Geo.SetZoneMaps({ [12] = 1429 }, {})
+        ns.Geo.SetTransform(1429, { cont = 0, ox = 0, oy = 0, ax = 3000, ay = 0, bx = 0, by = 2000 })
+        ns.Data.InitWith(db())
+        ns.Fire("SETTINGS_LOADED")
+    end)
+    check("trouble: loads", ok, err)
+    if ok then
+        local O = ns.Options
+        local fired = {}
+        for _, msg in ipairs({ "REQUEST_REPLAN", "SKIP_STEP", "SHOW_PANEL", "CVAR_PRESET" }) do
+            ns.On(msg, function(arg) fired[msg] = (fired[msg] or 0) + 1; fired[msg .. ":arg"] = arg end)
+        end
+        local frames = {}
+        for _, frame in ipairs(O.frames) do
+            frame.__scripts.OnShow(frame)
+            frames[frame.def.key] = frame
+        end
+
+        -- Every /ladder command has a place in the options: a switch for each toggle, and a
+        -- button, slider or box (marked with the command it stands for) for the rest.
+        local covered = {}
+        for _, page in ipairs(O.PAGES) do
+            for _, item in ipairs(page.items) do
+                local list = {}
+                if item.cmd then list[#list + 1] = item.cmd end
+                for _, b in ipairs(item.buttons or {}) do if b.cmd then list[#list + 1] = b.cmd end end
+                for _, c in ipairs(list) do
+                    if type(c) == "table" then for _, x in ipairs(c) do covered[x] = true end else covered[c] = true end
+                end
+                if item.kind == "check" then covered["key:" .. item.key] = true end
+            end
+        end
+        local f = assert(io.open(ADDON_DIR .. "/Core.lua", "r"))
+        local core = f:read("*a")
+        f:close()
+        local commands = {}
+        for c in core:gmatch('cmd == "(%w*)"') do commands[c] = true end
+        local OPENS_OPTIONS = { options = true, config = true, settings = true, menu = true }
+        local missing = {}
+        for c in pairs(commands) do
+            if not covered[c] and not OPENS_OPTIONS[c] then missing[#missing + 1] = "/ladder " .. c end
+        end
+        for name, spec in pairs(ns.toggles) do
+            for i = 1, #spec do
+                if not covered["key:" .. spec[i]] then missing[#missing + 1] = "/ladder " .. name .. " (" .. spec[i] .. ")" end
+            end
+        end
+        table.sort(missing)
+        check("options: every /ladder command has a control", #missing == 0 and next(commands) ~= nil, table.concat(missing, ", "))
+
+        -- the action buttons do what their commands do
+        local route, travel, main = frames.route.buttons, frames.travel.buttons, frames.main.buttons
+        route["Replan"].__scripts.OnClick(route["Replan"])
+        check("actions: Replan", fired.REQUEST_REPLAN == 1)
+        route["Skip this step"].__scripts.OnClick(route["Skip this step"])
+        check("actions: Skip this step", fired.SKIP_STEP == 1)
+        ns.charDB.ignored[42] = true
+        route["Un-skip all quests"].__scripts.OnClick(route["Un-skip all quests"])
+        check("actions: Un-skip all quests", ns.charDB.ignored[42] == nil)
+        travel["Bag planner"].__scripts.OnClick(travel["Bag planner"])
+        check("actions: Bag planner", fired.SHOW_PANEL == 1 and fired["SHOW_PANEL:arg"] == "bags")
+        travel["Gear upgrades"].__scripts.OnClick(travel["Gear upgrades"])
+        check("actions: Gear upgrades", fired["SHOW_PANEL:arg"] == "gear")
+        local okList = pcall(function()
+            route["Skipped quests"].__scripts.OnClick(route["Skipped quests"])
+            route["Dungeon quests"].__scripts.OnClick(route["Dungeon quests"])
+            main["List commands"].__scripts.OnClick(main["List commands"])
+        end)
+        check("actions: the lists print without errors", okList)
+
+        -- Gold to keep for training
+        check("gold: typed amounts", O.SetGold("5g 20s") and ns.db.goldReserve == 52000)
+        check("gold: as you'd type it", O.MoneyText(52000) == "5g 20s" and O.MoneyText(80) == "80c" and O.MoneyText(0) == "0c"
+            and O.MoneyText(10000) == "1g")
+        check("gold: auto", O.SetGold(" Auto ") and ns.db.goldReserve == nil)
+        ns.db.goldReserve = 30000
+        check("gold: empty means auto", O.SetGold("") and ns.db.goldReserve == nil)
+        ns.db.goldReserve = 30000
+        check("gold: nonsense changes nothing", O.SetGold("lots") == false and ns.db.goldReserve == 30000)
+        local goldBox
+        for _, c in ipairs(frames.travel.controls) do if c.item and c.item.kind == "money" then goldBox = c end end
+        goldBox:Refresh()
+        check("gold box: shows the amount", goldBox:GetText() == "3g", goldBox:GetText())
+        goldBox:SetText("7g")
+        goldBox.__scripts.OnEnterPressed(goldBox)
+        check("gold box: Enter saves it", ns.db.goldReserve == 70000 and goldBox:GetText() == "7g")
+        goldBox:SetText("12g")
+        goldBox.__scripts.OnEscapePressed(goldBox)
+        check("gold box: Escape puts it back", ns.db.goldReserve == 70000 and goldBox:GetText() == "7g", goldBox:GetText())
+        goldBox:SetText("auto")
+        goldBox.__scripts.OnEditFocusLost(goldBox)
+        check("gold box: clicking away saves too", ns.db.goldReserve == nil and goldBox:GetText() == "auto")
+
+        -- Stat weights
+        local boxes = {}
+        for _, c in ipairs(frames.travel.controls) do if c.stat then boxes[c.stat] = c end end
+        check("weights: a box per stat", boxes.agi and boxes.dps and boxes.armor and boxes.mp5 ~= nil)
+        boxes.agi:Refresh()
+        boxes.armor:Refresh()
+        check("weights: your class's values to start with", boxes.agi:GetText() == "0.6" and boxes.armor:GetText() == "0.01",
+            boxes.agi:GetText() .. " / " .. boxes.armor:GetText())
+        boxes.agi:SetText("2.5")
+        boxes.agi.__scripts.OnEnterPressed(boxes.agi)
+        check("weights: yours saved", ns.db.weights and ns.db.weights.agi == 2.5 and ns.Gear.Weights("WARRIOR").agi == 2.5)
+        boxes.agi:SetText("")
+        boxes.agi.__scripts.OnEnterPressed(boxes.agi)
+        check("weights: empty for the class's value again", ns.db.weights == nil and boxes.agi:GetText() == "0.6")
+        check("weights: nonsense refused", O.SetWeight("agi", "x") == false and O.SetWeight("agi", "-1") == false
+            and ns.db.weights == nil)
+        O.SetWeight("str", "3")
+        travel["Class defaults"].__scripts.OnClick(travel["Class defaults"])
+        check("weights: Class defaults clears yours", ns.db.weights == nil)
+
+        -- Having trouble?
+        check("trouble: the section is on the main page", main["Reload UI"] and main["Run diagnostics"]
+            and main["Report a bug or idea"] and main["Clear saved diagnostics"] ~= nil)
+        main["Reload UI"].__scripts.OnClick(main["Reload UI"])
+        check("trouble: Reload UI reloads", reloads == 1)
+        _G.SlashCmdList.QUESTLADDER("diag")
+        check("trouble: a /ladder diag typed in chat doesn't ask to reload", #popups == 0)
+        main["Run diagnostics"].__scripts.OnClick(main["Run diagnostics"])
+        local runs = _G.QuestLadderDiag and _G.QuestLadderDiag.runs
+        check("trouble: Run diagnostics runs them", runs and #runs == 2 and runs[2].label == "options")
+        local popup = popups[1]
+        check("trouble: ...then offers to reload", popup and popup.name == "QUESTLADDER_DIAG_RELOAD"
+            and popup.text:find("diagnostics are done", 1, true) and not O.diagPending, popup and popup.text)
+        _G.StaticPopupDialogs.QUESTLADDER_DIAG_RELOAD.OnAccept()
+        check("trouble: Reload now reloads", reloads == 2)
+        main["Clear saved diagnostics"].__scripts.OnClick(main["Clear saved diagnostics"])
+        check("trouble: Clear saved diagnostics", _G.QuestLadderDiag and #_G.QuestLadderDiag.runs == 0)
+
+        ns.recentErrors[#ns.recentErrors + 1] = { msg = "Interface/AddOns/QuestLadder/UI.lua:1: oops", count = 1 }
+        main["Report a bug or idea"].__scripts.OnClick(main["Report a bug or idea"])
+        local rf = _G.QuestLadderReportFrame
+        check("report: the window opens", rf and rf:IsShown())
+        check("report: links to copy", rf.github:GetText() == "https://github.com/Seltraeh/QuestLadder/issues/new/choose"
+            and rf.curse:GetText() == "https://www.curseforge.com/wow/addons/quest-ladder")
+        local details = rf.details:GetText() or ""
+        check("report: details to paste", details:find("Quest Ladder " .. ns.VERSION, 1, true)
+            and details:find("Client: 1.60.1 (build 71037, interface 16001)", 1, true)
+            and details:find("level 3", 1, true) and details:find("Zone: Elwynn Forest", 1, true)
+            and details:find("Errors this session: 1; first: Interface/AddOns/QuestLadder/UI.lua:1: oops", 1, true)
+            and details:find("Last diagnostics: none yet", 1, true), details)
+        check("report: no character name in it", not details:find("Mister", 1, true))
+        rf.github:SetText("typed over it")
+        rf.github.__scripts.OnTextChanged(rf.github, true)
+        check("report: the links can't be typed over", rf.github:GetText() == O.GITHUB_ISSUES)
+        rf.details:SetText("x")
+        rf.details.__scripts.OnTextChanged(rf.details, true)
+        check("report: ...nor the details", rf.details:GetText() == details)
+        ns.recentErrors = {}
+        local okAgain = pcall(O.ShowReport)
+        check("report: opens again", okAgain and O.reportFrame == rf)
+    end
+    _G.ReloadUI, _G.StaticPopupDialogs, _G.StaticPopup_Show, _G.GetBuildInfo, _G.GetZoneText = nil, nil, nil, nil, nil
+    _G.QuestLadderDiag, _G.Settings = nil, nil
+end
+
+---------------------------------------------------------------------------
 -- 16. TOC: every file listed in load order, version in step with Core.lua
 ---------------------------------------------------------------------------
 do
@@ -3381,6 +4442,7 @@ do
     local expected = {}
     for _, x in ipairs(FILES) do expected[#expected + 1] = x end
     expected[#expected + 1] = "UI.lua"
+    expected[#expected + 1] = "Options.lua"
     expected[#expected + 1] = "Diag.lua"
     check("toc: lists every add-on file in load order", table.concat(listed, ",") == table.concat(expected, ","),
         table.concat(listed, ","))

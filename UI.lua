@@ -9,7 +9,9 @@ local Geo, Ladder, Hints = ns.Geo, ns.Ladder, ns.Hints
 local MAX_TASK_LINES = 7
 local MAX_NEXT_LINES = 6
 local MAX_HINT_LINES = 4
-local WIDTH = 340
+local COMPACT_HINT_LINES = 2
+local COMPACT_MAX_NEXT = 3
+UI.MIN_WIDTH, UI.MAX_WIDTH = 260, 520
 
 local BACKDROP = {
     bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
@@ -18,12 +20,62 @@ local BACKDROP = {
     insets = { left = 3, right = 3, top = 3, bottom = 3 },
 }
 
-local function styled(frame)
-    if frame.SetBackdrop then
-        frame:SetBackdrop(BACKDROP)
-        frame:SetBackdropColor(0.05, 0.05, 0.08, 0.85)
-        frame:SetBackdropBorderColor(0.4, 0.4, 0.5, 1)
+local function clamp(v, lo, hi, default)
+    v = tonumber(v) or default
+    return math.max(lo, math.min(hi, math.floor(v + 0.5)))
+end
+
+--- The guide's width from the options (the hint box matches it).
+function UI.Width()
+    return clamp(ns.db.guideWidth, UI.MIN_WIDTH, UI.MAX_WIDTH, 340)
+end
+
+--- How many lines of the current step, upcoming steps and hints the guide shows right now.
+function UI.Limits()
+    local compact = ns.db.compact and true or false
+    local hints = clamp(ns.db.hintLines, 1, MAX_HINT_LINES, MAX_HINT_LINES)
+    if compact then
+        return { compact = true, tasks = clamp(ns.db.compactTaskLines, 1, MAX_TASK_LINES, 3),
+                 next = clamp(ns.db.compactNextSteps, 0, COMPACT_MAX_NEXT, 1),
+                 hints = math.min(hints, COMPACT_HINT_LINES), buttons = false, bagLine = false, gearLine = false }
     end
+    return { compact = false, tasks = MAX_TASK_LINES, next = clamp(ns.db.nextStepsShown, 0, MAX_NEXT_LINES, 4),
+             hints = hints, buttons = ns.db.showButtons and true or false,
+             bagLine = ns.db.showBagLine and true or false, gearLine = ns.db.showGearLine and true or false }
+end
+
+local function shown(frame, on)
+    if on then frame:Show() else frame:Hide() end
+end
+
+-- Windows painted with the theme's colors, repainted when they change.
+local styledFrames = {}
+
+local function paintFrame(frame)
+    if not frame.SetBackdropColor then return end
+    local r, g, b = ns.Theme.Color(frame.bgRole or "background")
+    local a = tonumber(ns.db.bgAlpha) or 0.85
+    a = math.max(frame.minAlpha or 0, math.min(1, math.max(0, a)))
+    frame:SetBackdropColor(r, g, b, a)
+    local br, bgc, bb = ns.Theme.Color("border")
+    frame:SetBackdropBorderColor(br, bgc, bb, 1)
+end
+
+local function styled(frame, bgRole, minAlpha)
+    if frame.SetBackdrop then frame:SetBackdrop(BACKDROP) end
+    frame.bgRole, frame.minAlpha = bgRole, minAlpha
+    styledFrames[#styledFrames + 1] = frame
+    paintFrame(frame)
+end
+
+--- Repaints every window (theme, colors or opacity changed).
+function UI.Restyle()
+    for _, f in ipairs(styledFrames) do paintFrame(f) end
+end
+
+--- "Quest Ladder" in the accent color, with the icon in front.
+local function titled(text, size)
+    return ns.Theme.IconText(size or 14) .. " " .. ns.Theme.Wrap("accent", "Quest Ladder") .. (text or "")
 end
 
 local function fontString(parent, template, width)
@@ -54,15 +106,43 @@ local function savePosition(frame)
     ns.charDB.frame = { point = point, relPoint = relPoint, x = x, y = y }
 end
 
+--- Puts the guide back where it starts (right side of the screen).
+function UI.ResetPosition()
+    ns.charDB.frame = {}
+    if not guide then return end
+    guide:ClearAllPoints()
+    guide:SetPoint("RIGHT", UIParent, "RIGHT", -60, 120)
+    UI.PlaceUseButton()
+end
+
+--- Compact mode on or off (the title bar's -/+ button, the icon's right-click).
+function UI.ToggleCompact()
+    ns.db.compact = not ns.db.compact
+    ns.Fire("SETTINGS_CHANGED")
+end
+
+local function iconTooltip(self)
+    GameTooltip:SetOwner(self, "ANCHOR_BOTTOMRIGHT")
+    GameTooltip:AddLine(titled(" " .. tostring(ns.VERSION)), 1, 1, 1)
+    GameTooltip:AddLine("Click: options", 1, 1, 1)
+    GameTooltip:AddLine("Right-click: compact mode " .. (ns.db.compact and "off" or "on"), 1, 1, 1)
+    GameTooltip:AddLine(ns.db.lockGuide and "The window is locked (unlock it in the options)"
+        or "Drag the window to move it", 0.7, 0.7, 0.7)
+    GameTooltip:Show()
+end
+
 local function buildGuide()
+    local width = UI.Width()
     guide = CreateFrame("Frame", "QuestLadderGuideFrame", UIParent, "BackdropTemplate")
-    styled(guide)
-    guide:SetSize(WIDTH, 120)
+    styled(guide, "background")
+    guide:SetSize(width, 120)
     guide:SetClampedToScreen(true)
     guide:SetMovable(true)
     guide:EnableMouse(true)
     guide:RegisterForDrag("LeftButton")
-    guide:SetScript("OnDragStart", guide.StartMoving)
+    guide:SetScript("OnDragStart", function(self)
+        if not ns.db.lockGuide then self:StartMoving() end
+    end)
     guide:SetScript("OnDragStop", function(self)
         self:StopMovingOrSizing()
         savePosition(self)
@@ -75,11 +155,26 @@ local function buildGuide()
         guide:SetPoint("RIGHT", UIParent, "RIGHT", -60, 120)
     end
 
+    -- 0.6.0: the icon opens the options (right-click: compact mode)
+    guide.icon = CreateFrame("Button", nil, guide)
+    guide.icon:SetSize(16, 16)
+    guide.icon:SetPoint("TOPLEFT", 7, -6)
+    guide.icon.tex = guide.icon:CreateTexture(nil, "ARTWORK")
+    guide.icon.tex:SetAllPoints()
+    guide.icon.tex:SetTexture(ns.Theme.ICON)
+    guide.icon:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    guide.icon:SetScript("OnClick", function(_, button)
+        if button == "RightButton" then UI.ToggleCompact() else ns.Fire("OPEN_OPTIONS") end
+    end)
+    guide.icon:SetScript("OnEnter", iconTooltip)
+    guide.icon:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
     guide.title = fontString(guide, "GameFontNormalSmall")
-    guide.title:SetPoint("TOPLEFT", 10, -8)
-    guide.title:SetText("|cff33ff99Quest Ladder|r")
+    guide.title:SetWordWrap(false)
+    guide.title:SetPoint("LEFT", guide.icon, "RIGHT", 4, 0)
 
     guide.counter = fontString(guide, "GameFontHighlightSmall")
+    guide.counter:SetWordWrap(false)
     guide.counter:SetPoint("LEFT", guide.title, "RIGHT", 6, 0)
 
     local close = CreateFrame("Button", nil, guide, "UIPanelCloseButton")
@@ -87,8 +182,18 @@ local function buildGuide()
     close:SetPoint("TOPRIGHT", 0, 0)
     close:SetScript("OnClick", function() ns.db.showGuide = false; UI.Refresh() end)
 
+    guide.compactBtn = smallButton(guide, "-", function() UI.ToggleCompact() end, 18)
+    guide.compactBtn:SetPoint("TOPRIGHT", -22, -5)
+    guide.compactBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        GameTooltip:AddLine(ns.db.compact and "Full mode: every line, upcoming steps, buttons"
+            or "Compact mode: just the current step", 1, 1, 1)
+        GameTooltip:Show()
+    end)
+    guide.compactBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
     guide.gearBtn = smallButton(guide, "Gear", function() UI.ShowPanel("gear") end, 40)
-    guide.gearBtn:SetPoint("TOPRIGHT", -22, -5)
+    guide.gearBtn:SetPoint("RIGHT", guide.compactBtn, "LEFT", -2, 0)
     guide.bagsBtn = smallButton(guide, "Bags", function() UI.ShowPanel("bags") end, 40)
     guide.bagsBtn:SetPoint("RIGHT", guide.gearBtn, "LEFT", -2, 0)
     guide.replanBtn = smallButton(guide, "Replan", function() ns.Fire("REQUEST_REPLAN", "button") end, 50)
@@ -96,25 +201,55 @@ local function buildGuide()
     guide.skipBtn = smallButton(guide, "Skip", function() ns.Fire("SKIP_STEP") end, 40)
     guide.skipBtn:SetPoint("RIGHT", guide.replanBtn, "LEFT", -2, 0)
 
-    guide.header = fontString(guide, "GameFontNormalLarge", WIDTH - 20)
+    guide.header = fontString(guide, "GameFontNormalLarge", width - 20)
     guide.header:SetPoint("TOPLEFT", 10, -30)
 
-    guide.distance = fontString(guide, "GameFontHighlightSmall", WIDTH - 20)
+    guide.distance = fontString(guide, "GameFontHighlightSmall", width - 20)
     guide.distance:SetPoint("TOPLEFT", guide.header, "BOTTOMLEFT", 0, -2)
 
     guide.tasks = {}
     for i = 1, MAX_TASK_LINES do
-        local fs = fontString(guide, "GameFontHighlight", WIDTH - 24)
+        local fs = fontString(guide, "GameFontHighlight", width - 24)
         guide.tasks[i] = fs
     end
     guide.nextLabel = fontString(guide, "GameFontDisableSmall")
     guide.nextLabel:SetText("Then:")
     guide.next = {}
     for i = 1, MAX_NEXT_LINES do
-        guide.next[i] = fontString(guide, "GameFontDisableSmall", WIDTH - 24)
+        guide.next[i] = fontString(guide, "GameFontDisableSmall", width - 24)
     end
-    guide.footer = fontString(guide, "GameFontHighlightSmall", WIDTH - 20)
-    guide.footer2 = fontString(guide, "GameFontHighlightSmall", WIDTH - 20)
+    guide.footer = fontString(guide, "GameFontHighlightSmall", width - 20)
+    guide.footer2 = fontString(guide, "GameFontHighlightSmall", width - 20)
+end
+
+--- Title bar: icon, name, step counter, then the buttons on the right. The name steps aside
+--- when the window is too narrow for it (the icon stays).
+local function layoutTitle(limits)
+    for _, b in ipairs({ guide.skipBtn, guide.replanBtn, guide.bagsBtn, guide.gearBtn }) do shown(b, limits.buttons) end
+    guide.compactBtn:SetText(limits.compact and "+" or "-")
+    guide.title:SetText(ns.Theme.Wrap("accent", "Quest Ladder"))
+    local right = 22 + 20 + (limits.buttons and 178 or 0)
+    local room = UI.Width() - right - 7 - 16 - 4
+    local need = (guide.title:GetStringWidth() or 0) + 6 + (guide.counter:GetStringWidth() or 0)
+    local showName = need <= room
+    shown(guide.title, showName)
+    guide.counter:ClearAllPoints()
+    if showName then
+        guide.counter:SetPoint("LEFT", guide.title, "RIGHT", 6, 0)
+    else
+        guide.counter:SetPoint("LEFT", guide.icon, "RIGHT", 4, 0)
+    end
+end
+
+--- Widths and fonts that follow the options.
+local function applyWidths(limits)
+    local width = UI.Width()
+    guide:SetWidth(width)
+    for _, fs in ipairs({ guide.header, guide.distance, guide.footer, guide.footer2 }) do fs:SetWidth(width - 20) end
+    for _, fs in ipairs(guide.tasks) do fs:SetWidth(width - 24) end
+    for _, fs in ipairs(guide.next) do fs:SetWidth(width - 24) end
+    local font = _G[limits.compact and "GameFontNormal" or "GameFontNormalLarge"]
+    if font then guide.header:SetFontObject(font) end
 end
 
 local function check(done) return done and "|TInterface\\RaidFrame\\ReadyCheck-Ready:12|t " or "|cffffffff-|r " end
@@ -136,6 +271,7 @@ local function timerText()
 end
 
 local function layoutGuide()
+    local limits = UI.Limits()
     local plan = Ladder.plan
     local step = Ladder.CurrentStep()
     local y = guide.distance:GetStringHeight() + guide.header:GetStringHeight() + 34
@@ -152,18 +288,23 @@ local function layoutGuide()
     for _, t in ipairs(step and step.tasks or {}) do
         lines[#lines + 1] = check(t.isDone) .. Ladder.TaskText(t)
     end
-    local shown = 0
+    local count = 0
+    -- the last line says how many more there are when the window can't show them all
+    local cap = math.min(limits.tasks, MAX_TASK_LINES)
     for i = 1, MAX_TASK_LINES do
         local fs = guide.tasks[i]
-        local text = lines[i]
+        local text = (i <= cap) and lines[i] or nil
         if text then
+            if i == cap and #lines > cap then
+                text = text .. string.format(" |cff888888(+%d more)|r", #lines - cap)
+            end
             fs:SetText(text)
             fs:ClearAllPoints()
             fs:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", (i == 1) and 4 or 0, -4)
             fs:Show()
             anchor = fs
             y = y + fs:GetStringHeight() + 4
-            shown = shown + 1
+            count = count + 1
         else
             fs:Hide()
         end
@@ -172,7 +313,7 @@ local function layoutGuide()
     -- upcoming steps
     local nextCount = 0
     if plan then
-        for i = 1, math.min(ns.db.nextStepsShown, MAX_NEXT_LINES) do
+        for i = 1, math.min(limits.next, MAX_NEXT_LINES) do
             local s = plan.steps[Ladder.current + i]
             local fs = guide.next[i]
             if s then
@@ -187,7 +328,7 @@ local function layoutGuide()
     end
     if nextCount > 0 then
         guide.nextLabel:ClearAllPoints()
-        guide.nextLabel:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", (shown > 0) and -4 or 0, -8)
+        guide.nextLabel:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", (count > 0) and -4 or 0, -8)
         guide.nextLabel:Show()
         y = y + guide.nextLabel:GetStringHeight() + 8
         anchor = guide.nextLabel
@@ -208,23 +349,36 @@ local function layoutGuide()
         for i = 1, MAX_NEXT_LINES do guide.next[i]:Hide() end
     end
 
-    -- footer: bags + gear
-    local bagLine = ns.Bags.Summary(plan)
-    local upgrade
-    for _, u in ipairs(ns.Gear.QuestUpgradeList()) do
-        if u.step >= Ladder.current then upgrade = u break end
+    -- footer: bags + gear (each can be switched off; compact mode leaves both out)
+    local bagLine = limits.bagLine and ns.Bags.Summary(plan) or nil
+    local gearLine
+    if limits.gearLine then
+        local upgrade
+        for _, u in ipairs(ns.Gear.QuestUpgradeList()) do
+            if u.step >= Ladder.current then upgrade = u break end
+        end
+        gearLine = upgrade and string.format("Gear: |cff00ff00%s|r (%s) from step %d",
+            upgrade.name, ns.Gear.PctText(upgrade.pct), upgrade.step) or nil
     end
-    local gearLine = upgrade and string.format("Gear: |cff00ff00%s|r (%s) from step %d",
-        upgrade.name, ns.Gear.PctText(upgrade.pct), upgrade.step) or nil
-    guide.footer:ClearAllPoints()
-    guide.footer:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", (anchor == guide.distance) and 0 or -4, -8)
-    guide.footer:SetText(bagLine or "")
-    y = y + guide.footer:GetStringHeight() + 8
-    guide.footer2:ClearAllPoints()
-    guide.footer2:SetPoint("TOPLEFT", guide.footer, "BOTTOMLEFT", 0, -2)
-    guide.footer2:SetText(gearLine or "")
-    y = y + guide.footer2:GetStringHeight() + 10
-    guide:SetHeight(math.max(y, 60))
+    if limits.bagLine or limits.gearLine then
+        guide.footer:ClearAllPoints()
+        guide.footer:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", (anchor == guide.distance) and 0 or -4, -8)
+        guide.footer:SetText(bagLine or "")
+        guide.footer:Show()
+        y = y + guide.footer:GetStringHeight() + 8
+        guide.footer2:ClearAllPoints()
+        guide.footer2:SetPoint("TOPLEFT", guide.footer, "BOTTOMLEFT", 0, -2)
+        guide.footer2:SetText(gearLine or "")
+        guide.footer2:Show()
+        y = y + guide.footer2:GetStringHeight() + 10
+    else
+        guide.footer:SetText("")
+        guide.footer2:SetText("")
+        guide.footer:Hide()
+        guide.footer2:Hide()
+        y = y + 6
+    end
+    guide:SetHeight(math.max(y, limits.compact and 40 or 60))
 end
 
 local function updateDistance()
@@ -257,7 +411,9 @@ function UI.RefreshGuide()
     if not guide then return end
     if not ns.db.showGuide then guide:Hide() return end
     guide:Show()
-    guide:SetScale(ns.db.guideScale or 1)
+    guide:SetScale(math.max(0.5, math.min(2, tonumber(ns.db.guideScale) or 1)))
+    local limits = UI.Limits()
+    applyWidths(limits)
     local plan = Ladder.plan
     local step = Ladder.CurrentStep()
     if not plan then
@@ -272,6 +428,7 @@ function UI.RefreshGuide()
         guide.counter:SetText(string.format("step %d/%d", Ladder.current, #plan.steps))
         guide.header:SetText(Ladder.StepTitle(step))
     end
+    layoutTitle(limits)
     updateDistance()
     layoutGuide()
 end
@@ -284,14 +441,13 @@ local pendingUseItem, pendingPlace
 
 local function buildHints()
     hintFrame = CreateFrame("Frame", "QuestLadderHintFrame", UIParent, "BackdropTemplate")
-    styled(hintFrame)
-    hintFrame:SetBackdropColor(0.15, 0.08, 0.02, 0.85)
-    hintFrame:SetSize(WIDTH, 40)
+    styled(hintFrame, "hintBackground")
+    hintFrame:SetSize(UI.Width(), 40)
     hintFrame:SetPoint("TOPLEFT", guide, "BOTTOMLEFT", 0, -4)
     hintFrame.lines = {}
     hintFrame.hits = {}
     for i = 1, MAX_HINT_LINES do
-        local fs = fontString(hintFrame, "GameFontHighlight", WIDTH - 20)
+        local fs = fontString(hintFrame, "GameFontHighlight", UI.Width() - 20)
         hintFrame.lines[i] = fs
         -- 0.3.29: a line that names a place (the Cozy Sleeping Bag start, a bag vendor) can be
         -- clicked for a map pin. A plain button over the line: no secure code, works in combat.
@@ -304,7 +460,7 @@ local function buildHints()
             local pin = self.hint and self.hint.pin
             if not pin then return end
             GameTooltip:SetOwner(self, "ANCHOR_TOP")
-            GameTooltip:AddLine("Quest Ladder: click for a map pin", 0.2, 1, 0.6)
+            GameTooltip:AddLine(titled(": click for a map pin", 12), 1, 1, 1)
             GameTooltip:AddLine((pin.title or "") .. ((ns.Goodies and ns.Goodies.PlaceText(pin)) and
                 ("  " .. ns.Goodies.PlaceText(pin)) or ""), 1, 1, 1)
             GameTooltip:Show()
@@ -327,7 +483,7 @@ local function buildHints()
         if self.itemId then
             GameTooltip:SetOwner(self, "ANCHOR_LEFT")
             GameTooltip:SetItemByID(self.itemId)
-            GameTooltip:AddLine("Quest Ladder: click (or your key binding) to use", 0.2, 1, 0.6)
+            GameTooltip:AddLine(titled(": click (or your key binding) to use", 12), 1, 1, 1)
             GameTooltip:Show()
         end
     end)
@@ -368,11 +524,15 @@ function UI.RefreshHints()
         hintFrame:Hide()
     else
         hintFrame:Show()
+        local width = UI.Width()
+        hintFrame:SetWidth(width)
+        local maxLines = UI.Limits().hints
         local y, anchor = 8, nil
         for i = 1, MAX_HINT_LINES do
             local fs = hintFrame.lines[i]
             local hit = hintFrame.hits and hintFrame.hits[i]
-            local h = list[i]
+            local h = (i <= maxLines) and list[i] or nil
+            fs:SetWidth(width - 20)
             if h then
                 fs:SetText(h.text .. (h.pin and " |cff888888(click for a map pin)|r" or ""))
                 fs:ClearAllPoints()
@@ -403,7 +563,7 @@ local PANEL_ROWS = 14
 
 local function buildPanel()
     panel = CreateFrame("Frame", "QuestLadderPanel", UIParent, "BackdropTemplate")
-    styled(panel)
+    styled(panel, "background", 0.85)
     panel:SetSize(420, 60)
     panel:SetPoint("CENTER", 0, 80)
     panel:SetMovable(true)
@@ -481,7 +641,7 @@ local ACTION_LABEL = {
 }
 
 local function showBags()
-    panel.title:SetText("Quest Ladder - bag planner")
+    panel.title:SetText(titled(" - bag planner"))
     local plan = Ladder.plan
     local bags = ns.QuestState.Bags()
     local list = ns.Bags.Suggestions(bags, Ladder.snapshot or {}, plan)
@@ -509,7 +669,7 @@ local function showBags()
 end
 
 local function showGear(scanned)
-    panel.title:SetText("Quest Ladder - gear upgrades")
+    panel.title:SetText(titled(" - gear upgrades"))
     local player = ns.QuestState.Player()
     local budget = ns.Gear.Budget(player)
     panel.status:SetText(string.format("Spending money: %s (keeping %s for training). %s",
@@ -579,7 +739,7 @@ local function hookTooltips()
         local id = data.id
         if ns.IsSecret(id) or not id then return end
         local note = tooltipNotes[id]
-        if note then tooltip:AddLine("Quest Ladder: " .. note, 0.2, 1, 0.6) end
+        if note and ns.db.tooltipNotes then tooltip:AddLine(titled(": " .. note, 12), 1, 1, 1) end
     end)
 end
 
@@ -654,7 +814,8 @@ ns.On("PLAN_UPDATED", function()
     Ladder.UpdateWaypoint()
 end)
 ns.On("PROGRESS_UPDATED", function() snapshotTime = GetTime(); UI.Refresh() end)
-ns.On("SETTINGS_CHANGED", UI.Refresh)
+ns.On("SETTINGS_CHANGED", function() UI.Restyle(); UI.Refresh() end)
+ns.On("THEME_CHANGED", function() UI.Restyle(); UI.Refresh() end)
 ns.On("HINTS_CHANGED", tick)
 ns.On("SHOW_PANEL", UI.ShowPanel)
 ns.On("HIGHLIGHT_REFRESH", refreshHighlights)

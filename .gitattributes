@@ -1,2 +1,5 @@
 # Keep line endings as they are (WoW reads either)
 * text=auto eol=lf
+# Textures are binary: never touch their bytes
+*.tga binary
+*.blp binary

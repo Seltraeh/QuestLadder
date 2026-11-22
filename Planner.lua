@@ -918,11 +918,14 @@ local function pruneTrips(order, start, opts)
             end
             local kept = {}
             for _, t in ipairs(order) do if not drop[t] then kept[#kept + 1] = t end end
-            local saves = base - Planner.RouteCost(kept, start)
+            -- 0.5.0: time the quest takes beyond its travel and kills (an escort's walk) counts too
+            local extra = 0
+            for q in pairs(counted) do extra = extra + (q.extraSeconds or 0) end
+            local saves = base - Planner.RouteCost(kept, start) + extra
             if saves <= Planner.TRIP_FREE_SECONDS then return nil end
             local worth = xp / (saves * rate) -- share of what grinding that long would give
             if worth >= Planner.TRIP_KEEP_SHARE then return nil end
-            return { worth = worth, saves = saves, xp = xp, quests = quests, kept = kept }
+            return { worth = worth, saves = saves, xp = xp, quests = quests, kept = kept, extra = extra }
         end
         local worst
         local function consider(e)
@@ -970,7 +973,8 @@ local function pruneTrips(order, start, opts)
         for _, q in ipairs(worst.quests) do
             pruned[#pruned + 1] = { quest = q, questId = q.id, title = q.title, xp = q.tripXP,
                                     groupXP = worst.xp, seconds = worst.saves, worth = worst.worth,
-                                    together = #worst.quests, inLog = q.outgrown or nil }
+                                    together = #worst.quests, inLog = q.outgrown or nil,
+                                    extra = (worst.extra or 0) > 0 and worst.extra or nil }
         end
         order = worst.kept
         if violations(order, opts) then order = fitLevelWaits(order, start, opts) end

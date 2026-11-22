@@ -2,13 +2,15 @@
 --
 -- WoW does not let add-ons draw on 3D objects the way RuneLite can, so this uses the hooks the
 -- game does offer:
---   * NPCs: a cyan box on their nameplate with a label under it (quest mobs, quest givers, turn-ins)
+--   * NPCs: a box on their nameplate with a label under it (quest mobs, quest givers, turn-ins)
 --   * Objects (books, crates, herbs, ore): Blizzard's soft-target system tells us what you are
 --     facing; when it is the objective you get a "this one" cue, and the nameplate the game
 --     shows for that object gets the box. /ladder interacticons turns on Blizzard's own icons
 --     over interactable objects.
---   * Places: small cyan boxes on the minimap and world map at the objective's spawn points
+--   * Places: small squares on the minimap and world map at the objective's spawn points
 --     (via the standalone HereBeDragons library; Questie's own copy is private to Questie).
+--     Each map has its own switch (/ladder minimap, /ladder worldmap) since Questie draws there too.
+-- Colors come from Theme.lua (cyan unless you pick a theme or your own color).
 
 local _, ns = ...
 local WM = {}
@@ -19,8 +21,6 @@ WM.object = {}  -- objectId -> label
 WM.mobs = {}    -- npcId -> true for mobs you fight (kill objectives and item drops)
 WM.softHit = nil
 WM.targetHit = nil
-
-local CYAN_R, CYAN_G, CYAN_B = 0.0, 1.0, 1.0
 
 ---------------------------------------------------------------------------
 -- GUIDs: "Creature-0-[server]-[instance]-[zone]-[npcId]-[spawn]"
@@ -69,6 +69,9 @@ function WM.SetTargets(step)
                         if fight then WM.mobs[id] = true end
                     end
                     for _, id in ipairs(t.obj.targets.object or {}) do WM.object[id] = label end
+                elseif t.kind == "visit" and t.visit == "grind" then
+                    -- 0.5.0: the mobs a "Grind first" stop names
+                    for _, id in ipairs(t.npcIds or {}) do WM.npc[id] = "Grind"; WM.mobs[id] = true end
                 elseif t.kind == "visit" and t.npcId then
                     WM.npc[t.npcId] = (t.visit == "flight" and "Flight path") or (t.visit == "bind" and "Innkeeper")
                         or (t.visit == "vendor" and "Vendor") or "Trainer"
@@ -83,6 +86,11 @@ function WM.SetTargets(step)
                 end
             end
         end
+    end
+    -- 0.5.0: a named mob near the route whose drop starts a quest gets a box when its plate shows
+    local plan = ns.Ladder and ns.Ladder.plan
+    for _, w in ipairs((plan and plan.watchFor) or {}) do
+        if w.npcId and not WM.npc[w.npcId] then WM.npc[w.npcId] = "Quest drop" end
     end
     WM.NoticeEnemyPlates()
     WM.RefreshNameplates()
@@ -102,7 +110,7 @@ function WM.NoticeEnemyPlates()
     local ok, value = pcall(get, "nameplateShowEnemies")
     if ok and not ns.IsSecret(value) and value == "0" then
         WM.toldEnemyPlates = true
-        ns.Print("enemy nameplates are off, so this step's quest mobs can't get a cyan box. "
+        ns.Print("enemy nameplates are off, so this step's quest mobs can't get a box. "
             .. "Press V (or Options > Nameplates) to show them.")
     end
 end
@@ -120,24 +128,18 @@ end
 
 local function newMark(plate)
     local m = CreateFrame("Frame", nil, plate)
-    for _, spec in ipairs({ { "TOPLEFT", "TOPRIGHT", true }, { "BOTTOMLEFT", "BOTTOMRIGHT", true },
-                            { "TOPLEFT", "BOTTOMLEFT", false }, { "TOPRIGHT", "BOTTOMRIGHT", false } }) do
-        local t = m:CreateTexture(nil, "OVERLAY")
-        t:SetColorTexture(CYAN_R, CYAN_G, CYAN_B, 1)
-        t:SetPoint(spec[1])
-        t:SetPoint(spec[2])
-        if spec[3] then t:SetHeight(2) else t:SetWidth(2) end
-    end
+    ns.Highlight.AddEdges(m)
     m.label = m:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     -- under the box: the mob's name sits right above its health bar, and a label there covered it
     m.label:SetPoint("TOP", m, "BOTTOM", 0, -2)
-    m.label:SetTextColor(CYAN_R, CYAN_G, CYAN_B)
+    ns.Highlight.Paint(m)
     plate.QuestLadderMark = m
     return m
 end
 
 local function markFor(plate, kind)
     local m = plate.QuestLadderMark or newMark(plate)
+    if ns.Highlight.NeedsPaint(m) then ns.Highlight.Paint(m) end
     -- the game reuses plates for other units, so place the box every time
     local anchor = anchorFor(plate, kind)
     m:ClearAllPoints()
@@ -157,7 +159,7 @@ function WM.DecoratePlate(unit)
     end
     if label then
         local m = markFor(plate, kind)
-        m.label:SetText(label)
+        m.label:SetText(ns.db.markerLabels and label or "")
         m:Show()
     elseif plate.QuestLadderMark then
         plate.QuestLadderMark:Hide()
@@ -212,7 +214,7 @@ ns.RegisterEvent("PLAYER_SOFT_INTERACT_CHANGED", function(_, _, newGuid)
     local was = WM.softHit
     if label then
         WM.softHit = { label = label, name = safeName("softinteract") }
-        if not was and PlaySound and SOUNDKIT and SOUNDKIT.MAP_PING then PlaySound(SOUNDKIT.MAP_PING) end
+        if not was and ns.db.pingSound and PlaySound and SOUNDKIT and SOUNDKIT.MAP_PING then PlaySound(SOUNDKIT.MAP_PING) end
     else
         WM.softHit = nil
     end
@@ -246,22 +248,31 @@ function WM.Hints(push, covered)
     covered = covered or {}
     if WM.softHit and not covered.softinteract then
         push({ priority = 99, kind = "info",
-               text = string.format("|cff00ffff>> This one:|r %s%s - press your Interact key",
+               text = string.format("%s>> This one:|r %s%s - press your Interact key", ns.Theme.Hex("marker"),
                    WM.softHit.label, WM.softHit.name and (" " .. WM.softHit.name) or "") })
     end
     if WM.targetHit and not covered.target then
         push({ priority = 64, kind = "info",
-               text = string.format("|cff00ffffTarget is right:|r %s %s", WM.targetHit.label, WM.targetHit.name or "") })
+               text = string.format("%sTarget is right:|r %s %s", ns.Theme.Hex("marker"), WM.targetHit.label,
+                   WM.targetHit.name or "") })
     end
 end
 
 ---------------------------------------------------------------------------
--- Minimap and world map boxes (HereBeDragons-Pins, loaded by Questie)
+-- Minimap and world map squares (HereBeDragons-Pins)
 ---------------------------------------------------------------------------
 local pinPool, usedPins = {}, {}
+WM.pinsShown = { minimap = 0, worldmap = 0 }
 
---- Diagnostics: minimap + world map boxes currently placed.
+--- Diagnostics: minimap + world map squares currently placed.
 function WM.PinCount() return #usedPins end
+
+--- Square size from the options: the minimap's, and the world map's (2 bigger).
+function WM.SquareSizes()
+    local n = math.floor((tonumber(ns.db.squareSize) or 7) + 0.5)
+    n = math.max(3, math.min(16, n))
+    return n, n + 2
+end
 
 local function pinFrame(size)
     local f = table.remove(pinPool)
@@ -269,8 +280,9 @@ local function pinFrame(size)
         f = CreateFrame("Frame", nil, UIParent)
         f.fill = f:CreateTexture(nil, "OVERLAY")
         f.fill:SetAllPoints()
-        f.fill:SetColorTexture(CYAN_R, CYAN_G, CYAN_B, 0.85)
     end
+    local r, g, b = ns.Theme.Color("map")
+    f.fill:SetColorTexture(r, g, b, 0.85)
     f:SetSize(size, size)
     usedPins[#usedPins + 1] = f
     return f
@@ -286,16 +298,24 @@ function WM.RefreshPins(step)
         pinPool[#pinPool + 1] = usedPins[i]
         usedPins[i] = nil
     end
-    if not (ns.db.worldMarks and step) then return end
+    WM.pinsShown = { minimap = 0, worldmap = 0 }
+    local onMinimap = ns.db.minimapSquares and true or false
+    local onWorldMap = (ns.db.worldMapSquares and pins.AddWorldMapIconMap ~= nil) and true or false
+    if not (step and (onMinimap or onWorldMap)) then return end
+    local miniSize, worldSize = WM.SquareSizes()
     local count = 0
     for _, t in ipairs(step.tasks) do
         if t.loc and not t.isDone then
             for _, p in ipairs(t.loc.members or { t.loc }) do
                 if count >= 30 then break end
                 if p.mapId and p.x and p.y then
-                    pins:AddMinimapIconMap(WM, pinFrame(7), p.mapId, p.x, p.y, true, false)
-                    if pins.AddWorldMapIconMap then
-                        pins:AddWorldMapIconMap(WM, pinFrame(9), p.mapId, p.x, p.y, HBD_PINS_WORLDMAP_SHOW_PARENT or 1)
+                    if onMinimap then
+                        pins:AddMinimapIconMap(WM, pinFrame(miniSize), p.mapId, p.x, p.y, true, false)
+                        WM.pinsShown.minimap = WM.pinsShown.minimap + 1
+                    end
+                    if onWorldMap then
+                        pins:AddWorldMapIconMap(WM, pinFrame(worldSize), p.mapId, p.x, p.y, HBD_PINS_WORLDMAP_SHOW_PARENT or 1)
+                        WM.pinsShown.worldmap = WM.pinsShown.worldmap + 1
                     end
                     count = count + 1
                 end
@@ -303,6 +323,18 @@ function WM.RefreshPins(step)
         end
     end
 end
+
+--- 0.6.0: a changed color, size or switch shows at once: markers on the plates already up, and
+--- the squares for the step you're on.
+function WM.Restyle()
+    WM.RefreshNameplates()
+    local step = ns.Ladder and ns.Ladder.CurrentStep and ns.Ladder.CurrentStep() or nil
+    WM.RefreshPins(step)
+end
+-- (the color picker changes the color many times a second while you drag: redraw at most 10x)
+local function restyleSoon() ns.Debounce("QuestLadder.marksRestyle", 0.1, WM.Restyle) end
+ns.On("THEME_CHANGED", restyleSoon)
+ns.On("SETTINGS_CHANGED", restyleSoon)
 
 ---------------------------------------------------------------------------
 -- Optional Blizzard settings presets (only when you ask, never in combat)
@@ -313,7 +345,7 @@ local PRESETS = {
         cvars = { SoftTargetInteract = "3", SoftTargetIconInteract = "1", SoftTargetIconGameObject = "1" },
     },
     npcplates = {
-        text = "Friendly NPC nameplates are on: quest givers and turn-ins get a cyan marker.",
+        text = "Friendly NPC nameplates are on: quest givers and turn-ins get a marker.",
         cvars = { nameplateShowFriendlyNPCs = "1" },
     },
 }

@@ -434,7 +434,7 @@ function Hints.Compute(env)
                             or Hints.UseTarget(stepTask[id] or later[1])
                         push({ priority = (units and 99 or 92) - (later and 1 or 0), kind = "use", itemId = itemId,
                                questId = id, button = true,
-                               text = (facing and "|cff00ffff>> This one:|r " or "") .. "Use " .. colorItem(itemName(itemId))
+                               text = (facing and (ns.Theme.Hex("marker") .. ">> This one:|r ") or "") .. "Use " .. colorItem(itemName(itemId))
                                    .. (on and (" on |cffffffff" .. on .. "|r") or " here") .. " for " .. colorQuest(q.title)
                                    .. (later and string.format(" (step %d, but you're here)", laterAt[id] or 0) or "")
                                    .. (units and (" - " .. Hints.UseHow()) or "") })
@@ -504,6 +504,10 @@ function Hints.Compute(env)
                 push({ priority = 94, kind = "use", itemId = ns.Travel.HEARTHSTONE, button = true,
                        text = string.format("|cff66ccffHearth now|r to %s - saves ~%d min of travel",
                            tr.bindName or "your inn", math.max(1, math.floor((tr.saving or 0) / 60 + 0.5))) })
+            elseif has and (readyIn or 0) > 0 and ns.Speed then
+                -- 0.5.0: the stone is cooling down: a break costs nothing, the cooldown ticks while logged out
+                local h = ns.Speed.HearthWaitHint(readyIn)
+                if h then push(h) end
             end
         else
             -- the same fly-or-walk call as the guide's travel line (re-checked from where you stand)
@@ -573,6 +577,9 @@ function Hints.Compute(env)
     end
     -- Forever extras: riding, a bigger bag, the sleeping bag chain, supply crates
     if ns.Goodies then ns.Goodies.Hints(push, env) end
+    -- 0.5.0 speed-leveling: watch for a named mob's quest drop, learn a profession for a quest,
+    -- grind here first, die and res when that's quicker
+    if ns.Speed then ns.Speed.Hints(push, env) end
 
     table.sort(out, function(a, b)
         if (a.priority or 0) ~= (b.priority or 0) then return (a.priority or 0) > (b.priority or 0) end
