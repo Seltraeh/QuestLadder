@@ -1,4 +1,4 @@
--- Quest Ladder: RuneLite-style cyan boxes on the interface.
+-- Quest Ladder: RuneLite-style boxes on the interface (cyan unless you pick a theme or color).
 --   * the quest item to use / the hearthstone to press, inside your open bags
 --   * the bag button holding it when the bags are closed ("open this bag")
 --   * gear upgrades to equip, and junk to sell while a vendor window is open
@@ -13,10 +13,43 @@ local _, ns = ...
 local HL = {}
 ns.Highlight = HL
 
-local CYAN_R, CYAN_G, CYAN_B = 0.0, 1.0, 1.0
-local THICKNESS = 2
-
 local pool, active = {}, {}
+
+--- Line thickness from the options (1-4 pixels).
+function HL.Thickness()
+    local t = tonumber(ns.db.markerThickness) or 2
+    return math.max(1, math.min(4, math.floor(t + 0.5)))
+end
+
+--- Colors a box (or a nameplate marker: same layout) with the theme's marker color and the
+--- chosen thickness. `f.edges` holds { texture, horizontal } pairs.
+function HL.Paint(f)
+    local r, g, b = ns.Theme.Color("marker")
+    local thick = HL.Thickness()
+    for _, e in ipairs(f.edges or {}) do
+        e[1]:SetColorTexture(r, g, b, 1)
+        if e[2] then e[1]:SetHeight(thick) else e[1]:SetWidth(thick) end
+    end
+    if f.label then f.label:SetTextColor(r, g, b) end
+    f.paintedVersion, f.paintedThickness = ns.Theme.version, thick
+end
+
+--- True when a box was painted before the last color or thickness change.
+function HL.NeedsPaint(f)
+    return f.paintedVersion ~= ns.Theme.version or f.paintedThickness ~= HL.Thickness()
+end
+
+--- The four edges of a box around `f`, painted.
+function HL.AddEdges(f)
+    f.edges = {}
+    for _, spec in ipairs({ { "TOPLEFT", "TOPRIGHT", true }, { "BOTTOMLEFT", "BOTTOMRIGHT", true },
+                            { "TOPLEFT", "BOTTOMLEFT", false }, { "TOPRIGHT", "BOTTOMRIGHT", false } }) do
+        local t = f:CreateTexture(nil, "OVERLAY")
+        t:SetPoint(spec[1])
+        t:SetPoint(spec[2])
+        f.edges[#f.edges + 1] = { t, spec[3] }
+    end
+end
 
 ---------------------------------------------------------------------------
 -- Box frames
@@ -24,21 +57,9 @@ local pool, active = {}, {}
 local function newBox()
     local f = CreateFrame("Frame", nil, UIParent)
     f:EnableMouse(false)
-    local function edge(p1, p2, horizontal)
-        local t = f:CreateTexture(nil, "OVERLAY")
-        t:SetColorTexture(CYAN_R, CYAN_G, CYAN_B, 1)
-        t:SetPoint(p1)
-        t:SetPoint(p2)
-        if horizontal then t:SetHeight(THICKNESS) else t:SetWidth(THICKNESS) end
-        return t
-    end
-    edge("TOPLEFT", "TOPRIGHT", true)
-    edge("BOTTOMLEFT", "BOTTOMRIGHT", true)
-    edge("TOPLEFT", "BOTTOMLEFT", false)
-    edge("TOPRIGHT", "BOTTOMRIGHT", false)
+    HL.AddEdges(f)
     f.label = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     f.label:SetPoint("BOTTOM", f, "TOP", 0, 1)
-    f.label:SetTextColor(CYAN_R, CYAN_G, CYAN_B)
     if f.CreateAnimationGroup then
         local ag = f:CreateAnimationGroup()
         ag:SetLooping("BOUNCE")
@@ -48,8 +69,20 @@ local function newBox()
         a:SetDuration(0.6)
         f.pulse = ag
     end
+    HL.Paint(f)
     f:Hide()
     return f
+end
+
+--- Starts or stops a box's fading, as the options say.
+local function setPulse(box)
+    if not box.pulse then return end
+    if ns.db.markerPulse then
+        if not box.pulsing then box.pulse:Play(); box.pulsing = true end
+    else
+        if box.pulsing then box.pulse:Stop(); box.pulsing = false end
+        box:SetAlpha(1)
+    end
 end
 
 --- Shows (or moves) the box `key` around `target`.
@@ -81,11 +114,10 @@ function HL.Box(key, target, label, pad, attach)
     -- have been raised since. (Only our own unprotected frame is touched.)
     if target.GetFrameStrata then box:SetFrameStrata(target:GetFrameStrata()) end
     if target.GetFrameLevel then box:SetFrameLevel((target:GetFrameLevel() or 1) + (attach and 10 or 20)) end
-    box.label:SetText(label or "")
-    if not box:IsShown() then
-        box:Show()
-        if box.pulse then box.pulse:Play() end
-    end
+    if HL.NeedsPaint(box) then HL.Paint(box) end
+    box.label:SetText(ns.db.markerLabels and label or "")
+    if not box:IsShown() then box:Show() end
+    setPulse(box)
     return box
 end
 
@@ -94,6 +126,7 @@ function HL.Clear(key)
     if not box then return end
     active[key] = nil
     if box.pulse then box.pulse:Stop() end
+    box.pulsing = false
     box:Hide()
     box:ClearAllPoints()
     -- Don't leave pooled boxes inside Blizzard's (or a bag add-on's) frames.
@@ -411,6 +444,17 @@ end)
 ns.RegisterEvent("QUEST_FINISHED", function() HL.rewardIndex = nil; HL.Clear("reward") end)
 ns.RegisterEvent("MERCHANT_SHOW", soon)
 ns.RegisterEvent("MERCHANT_CLOSED", soon)
+
+--- 0.6.0: a new color, thickness, label or pulse setting shows on the boxes already up.
+function HL.Restyle()
+    for _, box in pairs(active) do
+        if HL.NeedsPaint(box) then HL.Paint(box) end
+        setPulse(box)
+    end
+    soon()
+end
+ns.On("THEME_CHANGED", HL.Restyle)
+ns.On("SETTINGS_CHANGED", HL.Restyle)
 
 ns.On("SETTINGS_LOADED", function()
     if not hooksecurefunc then return end

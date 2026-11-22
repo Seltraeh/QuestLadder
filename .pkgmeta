@@ -4,5 +4,6 @@ package-as: QuestLadder
 
 ignore:
   - tests
+  - .github
   - .gitignore
   - .pkgmeta

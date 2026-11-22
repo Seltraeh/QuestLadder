@@ -7,4 +7,10 @@
     <Binding name="QUESTLADDER_TOGGLE" category="ADDONS">
         QuestLadder_Toggle()
     </Binding>
+    <Binding name="QUESTLADDER_COMPACT" category="ADDONS">
+        QuestLadder_Compact()
+    </Binding>
+    <Binding name="QUESTLADDER_OPTIONS" category="ADDONS">
+        QuestLadder_Options()
+    </Binding>
 </Bindings>

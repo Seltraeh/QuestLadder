@@ -393,6 +393,10 @@ Data.innkeepers = {}
 Data.transportMasters = {} -- zeppelin and boat masters
 Data.bagRewards = {}       -- [questId] = { bag itemId, ... }
 Data.vendorBags = {}       -- { {itemId, vendors = {npcId...}}, ... } plain bags vendors sell
+Data.questDrops = {}       -- 0.5.0: { {itemId, questId, npcs = {npcId...}}, ... } named mobs' drops that start a quest
+Data.mobGrid = {}          -- 0.5.0: mobGrid[cont][cellKey] = { {npcId, point, minLevel, maxLevel}, ... } mobs to grind
+Data.QUEST_DROP_MAX_NPCS = 3 -- more droppers than this: a lucky drop off common mobs, not a named mob
+Data.MOB_GRID_POINTS = 12    -- spawn points kept per mob for "grind here"
 local TRANSPORT_TITLES = { "zeppelin", "dockmaster", "harbormaster", "boat" }
 
 local function cellKey(wx, wy) return math.floor(wx / CELL) .. ":" .. math.floor(wy / CELL) end
@@ -421,6 +425,7 @@ function Data.BuildIndexes(player, onDone)
         Data.gearByLevel, Data.vendors, Data.trainers = {}, {}, {}
         Data.flightMasters, Data.innkeepers, Data.transportMasters = {}, {}, {}
         Data.bagRewards, Data.vendorBags = {}, {}
+        Data.questDrops, Data.mobGrid = {}, {}
 
         -- Quests: starters (spatial) + reverse prerequisites (chains)
         local ids = Q.GetAllIds()
@@ -454,6 +459,14 @@ function Data.BuildIndexes(player, onDone)
         local itemIds = I.GetAllIds()
         for i = 1, #itemIds do
             local id = itemIds[i]
+            -- a named mob's drop that starts a quest (Owatanka's Tailspike): "watch for" hints
+            local starts = num(I.Get(id, "startQuest"))
+            if starts > 0 then
+                local drops = I.Get(id, "npcDrops")
+                if type(drops) == "table" and #drops >= 1 and #drops <= Data.QUEST_DROP_MAX_NPCS then
+                    Data.questDrops[#Data.questDrops + 1] = { itemId = id, questId = starts, npcs = drops }
+                end
+            end
             local class = num(I.Get(id, "class"))
             if class == 1 and num(I.Get(id, "subClass")) == 0 then
                 for _, qid in ipairs(I.Get(id, "questRewards") or {}) do
@@ -513,6 +526,23 @@ function Data.BuildIndexes(player, onDone)
                         if isTransport then Data.transportMasters[#Data.transportMasters + 1] = entry end
                     end
                 end
+            elseif flags == 0 and N.Get(id, "friendlyToFaction") == nil then
+                -- an ordinary mob (no service, nobody's friend, not elite): somewhere to grind
+                local rank = num(N.Get(id, "rank"))
+                local lo = num(N.Get(id, "minLevel"))
+                if rank == 0 and lo >= 2 and not N.Get(id, "questStarts") then
+                    local hi = math.max(lo, num(N.Get(id, "maxLevel")))
+                    local pts = Geo.PointsFromSpawns(N.Get(id, "spawns"), Data.MOB_GRID_POINTS)
+                    for j = 1, #pts do
+                        local p = pts[j]
+                        local grid = Data.mobGrid[p.cont]
+                        if not grid then grid = {}; Data.mobGrid[p.cont] = grid end
+                        local key = cellKey(p.wx, p.wy)
+                        local cell = grid[key]
+                        if not cell then cell = {}; grid[key] = cell end
+                        cell[#cell + 1] = { npcId = id, point = p, minLevel = lo, maxLevel = hi }
+                    end
+                end
             end
             ns.MaybeYield(80)
         end
@@ -552,6 +582,46 @@ function Data.StartersNear(point, radius)
     end
     for _, e in pairs(seen) do out[#out + 1] = e end
     table.sort(out, function(a, b) return a.dist < b.dist end)
+    return out
+end
+
+--- 0.5.0: mobs to grind within `radius` of `point` whose level range overlaps [lo, hi]:
+--- { {npcId, name, minLevel, maxLevel, count, dist, point}, ... }, most spawns nearby first.
+function Data.MobsNear(point, radius, lo, hi)
+    local out = {}
+    if not point then return out end
+    local grid = Data.mobGrid[point.cont]
+    if not grid then return out end
+    local cx, cy = math.floor(point.wx / CELL), math.floor(point.wy / CELL)
+    local r = math.ceil(radius / CELL)
+    local byNpc = {}
+    for dx = -r, r do
+        for dy = -r, r do
+            for _, e in ipairs(grid[(cx + dx) .. ":" .. (cy + dy)] or {}) do
+                if e.maxLevel >= lo and e.minLevel <= hi then
+                    local d = Geo.Distance(point, e.point)
+                    if d and d <= radius then
+                        local m = byNpc[e.npcId]
+                        if not m then
+                            m = { npcId = e.npcId, minLevel = e.minLevel, maxLevel = e.maxLevel, count = 0 }
+                            byNpc[e.npcId] = m
+                        end
+                        m.count = m.count + 1
+                        if not m.dist or d < m.dist then m.dist, m.point = d, e.point end
+                    end
+                end
+            end
+        end
+    end
+    for _, m in pairs(byNpc) do
+        m.name = Data.NpcName(m.npcId)
+        out[#out + 1] = m
+    end
+    table.sort(out, function(a, b)
+        if a.count ~= b.count then return a.count > b.count end
+        if a.dist ~= b.dist then return a.dist < b.dist end
+        return a.npcId < b.npcId
+    end)
     return out
 end
 

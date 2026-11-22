@@ -3,7 +3,7 @@
 
 local ADDON, ns = ...
 ns.ADDON = ADDON or "QuestLadder"
-ns.VERSION = "0.4.0"
+ns.VERSION = "0.6.0"
 
 ---------------------------------------------------------------------------
 -- Settings
@@ -17,6 +17,28 @@ ns.defaults = {
     guideScale = 1,
     nextStepsShown = 4,
 
+    -- 0.6.0: how it looks (Game Menu > Options > AddOns > Quest Ladder, or /ladder options)
+    theme = "cyan",            -- a set of colors (Theme.lua): cyan, pink, lavender, gold, green, red, frost
+    colors = {},               -- colors you picked yourself on top of the theme, by role
+    bgAlpha = 0.85,            -- window background opacity
+    compact = false,           -- compact mode: just the current step, fewer lines, no buttons or footer
+    compactTaskLines = 3,      -- lines of the current step in compact mode
+    compactNextSteps = 1,      -- upcoming steps in compact mode
+    guideWidth = 340,          -- guide and hint box width
+    lockGuide = false,         -- stop the guide window from being dragged
+    showButtons = true,        -- the Skip / Replan / Bags / Gear buttons
+    showBagLine = true,        -- the bag-space line under the steps
+    showGearLine = true,       -- the next gear upgrade line under the steps
+    hintLines = 4,             -- most lines in the hint box
+    tooltipNotes = true,       -- "Quest Ladder: Sell ..." lines on item tooltips
+    markerThickness = 2,       -- box and nameplate marker line thickness
+    markerPulse = true,        -- boxes fade in and out
+    markerLabels = true,       -- "Use", "Kill", "Turn in" labels on boxes and markers
+    minimapSquares = true,     -- squares on the minimap where this step's targets are
+    worldMapSquares = true,    -- the same squares on the world map
+    squareSize = 7,            -- minimap square size (world map squares are 2 bigger)
+    pingSound = true,          -- a ping when you face this step's object
+
     includeUnstarted = true,   -- plan quests you have not picked up yet (from QuestieDB)
     maxCandidates = 25,        -- how many not-yet-accepted quests to pull into the plan (was 12)
     pickupRadius = 900,        -- yards: how far away a quest giver may be to be considered
@@ -26,6 +48,9 @@ ns.defaults = {
     tripCheck = true,          -- skip new quests whose detour earns less XP than killing mobs for that long
     skipDungeonQuests = true,  -- objectives that only exist inside instances
     skipEscortsAndElites = false,
+    skipGroupQuests = true,    -- 0.5.0: new quests against elites at your level need a group (/ladder groupquests)
+    grindFirst = true,         -- 0.5.0: grind where you are when the next quests' mobs would be too high
+    deathTravel = true,        -- 0.5.0: say when dying and resurrecting at the spirit healer is quicker
 
     autoAccept = true,         -- accept quests that are in the plan when YOU open the quest dialog
     autoTurnIn = true,         -- complete quests with zero or one reward when YOU open the dialog
@@ -33,12 +58,13 @@ ns.defaults = {
     -- Holding Shift while talking to an NPC always suspends the automation above.
 
     waypoints = true,          -- put Blizzard's map pin / TomTom arrow on the current step
+    unhideArrow = true,        -- 0.5.0: show Blizzard's arrow to our pin when Forever rates it "Invalid" (it draws those see-through)
     useFlights = true,         -- route through flight paths you know
     useHearth = true,          -- plan where to use the hearthstone
     suggestBind = true,        -- suggest binding at a better inn when it saves 3+ minutes
     discoverFlights = true,    -- add flight masters within a ~1 minute detour
-    highlights = true,         -- cyan boxes on bag items, bag buttons and the reward to pick
-    worldMarks = true,         -- cyan markers on quest NPC nameplates and minimap/map boxes
+    highlights = true,         -- boxes on bag items, bag buttons and the reward to pick
+    worldMarks = true,         -- markers on quest NPC nameplates and the "This one" cue (map squares: minimapSquares)
     reserveSlots = 2,          -- bag slots to always keep free (gathering, profession mats, loot)
     goldReserve = nil,         -- copper to keep for training; nil = automatic by level
     lookahead = 10,            -- steps considered for bag-space and gear timing
@@ -65,10 +91,29 @@ ns.ApplyDefaults = applyDefaults
 --- Saved settings hold every default as a value, so a changed default needs a one-time update.
 --- Only values still at the old default change; anything you set yourself stays.
 --- 1 (0.3.15): maxCandidates 12 -> 25, so all the quests around a hub fit in the plan.
+--- 2 (0.6.0): the map squares got their own switches; if you had turned world marks off
+---   (which used to hide the squares too), they stay off.
 function ns.MigrateSettings(db)
     local v = db.settingsVersion or 0
     if v < 1 and db.maxCandidates == 12 then db.maxCandidates = ns.defaults.maxCandidates end
-    db.settingsVersion = 1
+    if v < 2 and db.worldMarks == false then
+        db.minimapSquares, db.worldMapSquares = false, false
+    end
+    db.settingsVersion = 2
+end
+
+--- Every setting back to its default. Learned data (graveyards, flight paths, ignored quests)
+--- isn't a setting and stays.
+function ns.ResetSettings(db)
+    db = db or ns.db
+    for k, v in pairs(ns.defaults) do
+        if type(v) == "table" then
+            db[k] = applyDefaults({}, v)
+        else
+            db[k] = v
+        end
+    end
+    db.weights, db.goldReserve = nil, nil
 end
 
 -- Usable before ADDON_LOADED (and in tests): defaults until the saved table arrives.
@@ -81,10 +126,12 @@ ns.charDB = { ignored = {}, deferred = {}, frame = {} }
 local PREFIX = "|cff33ff99Quest Ladder|r: "
 function ns.Print(fmt, ...)
     local msg = select("#", ...) > 0 and string.format(fmt, ...) or tostring(fmt)
+    local prefix = PREFIX
+    if ns.Theme then prefix = ns.Theme.Name(12) .. ": " end
     if DEFAULT_CHAT_FRAME then
-        DEFAULT_CHAT_FRAME:AddMessage(PREFIX .. msg)
+        DEFAULT_CHAT_FRAME:AddMessage(prefix .. msg)
     else
-        print(PREFIX .. msg)
+        print(prefix .. msg)
     end
 end
 
@@ -331,7 +378,30 @@ local toggles = {
     highlights = { "highlights" },
     marks = { "worldMarks" },
     debug = { "debug" },
+    groupquests = { "skipGroupQuests", invert = true },
+    grind = { "grindFirst" },
+    dietravel = { "deathTravel" },
+    arrow = { "unhideArrow" },
+    -- 0.6.0: display-only switches (no replan)
+    compact = { "compact", display = true },
+    minimap = { "minimapSquares", display = true },
+    worldmap = { "worldMapSquares", display = true },
+    lock = { "lockGuide", display = true },
 }
+ns.toggles = toggles
+
+--- Prints the themes, marking the one in use.
+local function listThemes()
+    local T = ns.Theme
+    local names = {}
+    for _, p in ipairs(T.PRESETS) do
+        local r, g, b = p.colors.marker[1], p.colors.marker[2], p.colors.marker[3]
+        local swatch = string.format("|cff%02x%02x%02x%s|r", math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5),
+            math.floor(b * 255 + 0.5), p.key)
+        names[#names + 1] = (p.key == T.Preset().key) and ("[" .. swatch .. "]") or swatch
+    end
+    ns.Print("themes: %s. Type /ladder theme <name>, or pick colors one by one in /ladder options.", table.concat(names, " "))
+end
 
 local function help()
     ns.Print("commands:")
@@ -350,6 +420,16 @@ local function help()
     print("  /ladder trips           toggle skipping quests not worth the walk, new and outgrown (now " .. onOff(ns.db.tripCheck) .. ")")
     print("  /ladder minxp <percent> skip new quests worth under this % of a solid quest at your level (now "
         .. math.floor((ns.db.minQuestValue or 0) * 100 + 0.5) .. "%, 0 = keep all)")
+    print("  /ladder groupquests     toggle planning new quests against elites at your level (now " .. onOff(not ns.db.skipGroupQuests) .. ")")
+    print("  /ladder grind           toggle \"grind first\" stops before mobs that would be too high (now " .. onOff(ns.db.grindFirst) .. ")")
+    print("  /ladder dietravel       toggle the \"die and res, it's quicker\" tip (now " .. onOff(ns.db.deathTravel) .. ")")
+    print("  /ladder arrow           toggle showing Blizzard's arrow to Quest Ladder's pin when the game hides it (now " .. onOff(ns.db.unhideArrow) .. ")")
+    print("  /ladder options         open the options (colors, window, markers, route) - also in Game Menu > Options > AddOns")
+    print("  /ladder compact         toggle compact mode: just the current step (now " .. onOff(ns.db.compact) .. ")")
+    print("  /ladder theme [name]    list the color themes, or switch (cyan, pink, lavender, gold, green, red, frost)")
+    print("  /ladder minimap|worldmap   toggle the squares on the minimap / world map (now "
+        .. onOff(ns.db.minimapSquares) .. " / " .. onOff(ns.db.worldMapSquares) .. ")")
+    print("  /ladder lock            toggle locking the guide window in place (now " .. onOff(ns.db.lockGuide) .. ")")
     print("  /ladder weight <stat> <n>  override a stat weight (str agi sta int spi armor dps ap sp)")
     print("  /ladder auto|autopick|unstarted|waypoints|hints  toggle a feature")
     print("  /ladder flights|hearth|bind|discover|highlights|marks     toggle travel / highlight features")
@@ -453,14 +533,27 @@ SlashCmdList.QUESTLADDER = function(input)
         ns.Fire("CVAR_PRESET", cmd)
     elseif cmd == "diag" then
         ns.Fire("RUN_DIAG", rest)
+    elseif cmd == "options" or cmd == "config" or cmd == "settings" or cmd == "menu" then
+        ns.Fire("OPEN_OPTIONS")
+    elseif cmd == "theme" or cmd == "color" or cmd == "colors" then
+        local p = ns.Theme.Find(rest)
+        if p then
+            ns.Theme.SetPreset(p.key)
+            ns.Print("theme: %s", ns.Theme.Wrap("marker", p.name))
+            ns.Fire("SETTINGS_CHANGED")
+        else
+            if rest ~= "" then ns.Print("no theme called \"%s\"", rest) end
+            listThemes()
+        end
     elseif toggles[cmd] then
         local spec = toggles[cmd]
         local newValue = not ns.db[spec[1]]
         for i = 1, #spec do ns.db[spec[i]] = newValue end
-        local shown = spec.invert and not newValue or newValue
+        local shown = newValue
+        if spec.invert then shown = not newValue end
         ns.Print("%s: %s", cmd, onOff(shown))
         ns.Fire("SETTINGS_CHANGED")
-        ns.Fire("REQUEST_REPLAN", "settings")
+        if not spec.display then ns.Fire("REQUEST_REPLAN", "settings") end
     else
         help()
     end
@@ -472,6 +565,10 @@ BINDING_HEADER_QUESTLADDER = "Quest Ladder"
 _G["BINDING_NAME_CLICK QuestLadderUseButton:LeftButton"] = "Quest Ladder: use the suggested quest item"
 BINDING_NAME_QUESTLADDER_SKIP = "Quest Ladder: skip current step"
 BINDING_NAME_QUESTLADDER_TOGGLE = "Quest Ladder: show/hide guide"
+BINDING_NAME_QUESTLADDER_COMPACT = "Quest Ladder: compact mode on/off"
+BINDING_NAME_QUESTLADDER_OPTIONS = "Quest Ladder: open the options"
 
 function QuestLadder_Skip() ns.Fire("SKIP_STEP") end
 function QuestLadder_Toggle() SlashCmdList.QUESTLADDER("") end
+function QuestLadder_Compact() SlashCmdList.QUESTLADDER("compact") end
+function QuestLadder_Options() ns.Fire("OPEN_OPTIONS") end

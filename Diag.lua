@@ -470,6 +470,8 @@ check("waypoint", "2. Waypoint pin (C_Map.SetUserWaypoint / TomTom)", function(c
         data.userWaypoint = wp
     end
     data.superTracking = value(C_SuperTrack and C_SuperTrack.IsSuperTrackingUserWaypoint)
+    data.inGameNavigation = cvar("showInGameNavigation") -- 0.4.1: "0" hides Blizzard's arrow (nil: Forever has no such setting)
+    data.nav = Diag.NavigationState()
     if not ns.db.waypoints then return "skip", "waypoints are off (/ladder waypoints)", data end
     if not target then return "skip", "no current step with a location", data end
     if data.tomtom then return "info", "TomTom is installed, so the arrow is TomTom's (check it on screen)", data end
@@ -484,8 +486,58 @@ check("waypoint", "2. Waypoint pin (C_Map.SetUserWaypoint / TomTom)", function(c
     data.matchesTarget = same and true or false
     if not same then return "warn", "a pin is set, but not on the current step (your own pin, or another map)", data end
     if data.superTracking == false then return "warn", "the pin is set but not tracked (no arrow on screen)", data end
-    return "ok", string.format("pin on map %s at %.3f, %.3f matches the current step", str(uw.mapId), uw.x, uw.y), data
+    if data.inGameNavigation == "0" then
+        return "warn", "the pin is right, but the game's In-Game Navigation setting is off, so there's no arrow on screen "
+            .. "(/console showInGameNavigation 1)", data
+    end
+    -- 0.5.0: the pin is right and tracked; is Blizzard drawing its arrow? (what it navigates to, and how)
+    local nav = data.nav
+    if nav.priority ~= nil and nav.priority ~= nav.userWaypointType then
+        return "warn", "the pin is right, but the game is navigating to something else (type " .. str(nav.priority)
+            .. (nav.questId and nav.questId ~= 0 and (", quest " .. str(nav.questId)) or "") .. ")", data
+    end
+    if nav.api and nav.frame == false then
+        return "warn", "the pin is right and tracked, but the game made no navigation frame for it, so Blizzard draws no arrow", data
+    end
+    return "ok", string.format("pin on map %s at %.3f, %.3f matches the current step; arrow frame %s, alpha %s, edge arrow %s",
+        str(uw.mapId), uw.x, uw.y, str(nav.frame), str(nav.alpha), str(nav.arrowShown)), data
 end)
+
+--- 0.5.0: Blizzard's arrow to the tracked pin, as the game reports it right now (the arrow went
+--- missing on Forever while the pin was set and tracked).
+function Diag.NavigationState()
+    local nav = { api = C_Navigation ~= nil }
+    local E = Enum and Enum.SuperTrackingType
+    nav.userWaypointType = E and E.UserWaypoint or 1
+    nav.priority = value(C_SuperTrack and C_SuperTrack.GetHighestPrioritySuperTrackingType)
+    nav.anything = value(C_SuperTrack and C_SuperTrack.IsSuperTrackingAnything)
+    nav.quest = value(C_SuperTrack and C_SuperTrack.IsSuperTrackingQuest)
+    nav.questId = value(C_SuperTrack and C_SuperTrack.GetSuperTrackedQuestID)
+    nav.mapPin = value(C_SuperTrack and C_SuperTrack.IsSuperTrackingMapPin)
+    if C_Navigation then
+        local okF, frame = try(C_Navigation.GetFrame)
+        nav.frame = okF and frame ~= nil or false
+        nav.state = value(C_Navigation.GetTargetState)
+        nav.onScreen = value(C_Navigation.HasValidScreenPosition)
+        nav.clamped = value(C_Navigation.WasClampedToScreen)
+        nav.distance = value(C_Navigation.GetDistance)
+    end
+    -- Quest Ladder's unhiding of the arrow for its own pins (0.5.0)
+    nav.unhideSetting = ns.db.unhideArrow
+    nav.hooked = ns.Ladder and ns.Ladder.arrowHooked or false
+    nav.ourPinTracked = ns.Ladder and ns.Ladder.RefreshOurPin and ns.Ladder.RefreshOurPin() or false
+    local f = _G.SuperTrackedFrame
+    if type(f) == "table" then
+        nav.blizzardFrame = true
+        nav.shown = value(f.IsShown, f)
+        nav.alpha = value(f.GetAlpha, f)
+        local arrow = f.Arrow
+        if type(arrow) == "table" then nav.arrowShown = value(arrow.IsShown, arrow) end
+    else
+        nav.blizzardFrame = false
+    end
+    return nav
+end
 
 check("rewards", "3. Quest rewards by quest ID (no quest opened)", function(ctx)
     if type(GetNumQuestLogChoices) ~= "function" then return "fail", "GetNumQuestLogChoices is missing", nil end
@@ -647,6 +699,70 @@ check("goodies", "3c. Forever extras (bags, riding, sleeping bag chain, crates, 
     return "info", string.format("smallest bag %d slots; %s; %d must-do quests in the plan; crate NPC %s",
         data.smallestBag, data.bagToBuy and ("buy: " .. data.bagToBuy) or "no bag to buy", #data.mustDoInPlan,
         tostring(data.crateNpc)), data
+end)
+
+check("speed", "3d. Speed-leveling (grind first, die and res, watch for, professions, group quests)", function(ctx)
+    local S, p = ns.Speed, ctx.player
+    if not (S and p) then return "skip", "no player info", nil end
+    local plan = ns.Ladder.plan
+    local data = { settings = { grindFirst = ns.db.grindFirst, deathTravel = ns.db.deathTravel, skipGroupQuests = ns.db.skipGroupQuests } }
+    -- graveyards: does Forever's C_DeathInfo list them for this map? (the die-and-res tip needs it)
+    data.graveyardApi = C_DeathInfo ~= nil and type(C_DeathInfo.GetGraveyardsForMap) == "function"
+    local mapId = p.point and p.point.mapId
+    data.mapId = mapId
+    local okRaw, raw = try(C_DeathInfo and C_DeathInfo.GetGraveyardsForMap, mapId)
+    if okRaw and type(raw) == "table" and not ns.IsSecret(raw) then
+        data.graveyardsRaw = #raw
+        data.graveyardFirst = raw[1]
+    else
+        data.graveyardsRaw = okRaw and type(raw) or ("error: " .. str(raw))
+    end
+    -- the continent map too, in case Forever lists graveyards there rather than per zone
+    local okCM, cm = try(ns.Travel.ContinentMap, mapId)
+    local cont = okCM and type(plain(cm)) == "number" and cm or nil
+    if cont and cont ~= mapId then
+        local okC, onCont = try(C_DeathInfo and C_DeathInfo.GetGraveyardsForMap, cont)
+        data.continentMap = cont
+        data.graveyardsOnContinent = (okC and type(onCont) == "table" and not ns.IsSecret(onCont)) and #onCont or nil
+    end
+    S.ResetGraveyards()
+    local game = S.GameGraveyards(mapId)
+    data.graveyardsHere = #game
+    data.graveyardsLearned = #S.LearnedGraveyards()
+    local gy = S.NearestGraveyard(p.point)
+    data.nearestGraveyard = gy and string.format("%s at %.3f, %.3f (map %s), %d yd", tostring(gy.gyName), gy.x or 0, gy.y or 0,
+        tostring(gy.mapId), math.floor((ns.Geo.Distance(p.point, gy) or 0) + 0.5)) or nil
+    local okL, live = try(ns.Ladder.LiveTravel, ctx.step, p.point)
+    if okL and live and live.die then
+        data.dieTip = string.format("%s instead of %s via %s", tostring(math.floor(live.die.total)), tostring(math.floor(live.dieVs or 0)),
+            tostring(live.die.name))
+    end
+    -- QuestieDB facts behind the other tips
+    data.questDropsIndexed = #(ns.Data.questDrops or {})
+    local cells = 0
+    for _, grid in pairs(ns.Data.mobGrid or {}) do cells = cells + count(grid) end
+    data.mobGridCells = cells
+    data.watchFor = {}
+    for _, w in ipairs((plan and plan.watchFor) or {}) do
+        data.watchFor[#data.watchFor + 1] = string.format("%s (lvl %s) step %s -> %s %s", tostring(w.npcName), tostring(w.level),
+            tostring(w.step), tostring(w.questId), tostring(w.title))
+    end
+    data.skillUnlocks = {}
+    for _, u in ipairs((plan and plan.skillUnlocks) or {}) do
+        data.skillUnlocks[#data.skillUnlocks + 1] = string.format("%s: %s %s", tostring(u.skill), tostring(u.questId), tostring(u.title))
+    end
+    data.groupSkipped = #((plan and plan.skippedGroup) or {})
+    data.grindStop = plan and plan.grindStop and plan.grindStop.label or nil
+    data.levelNow = S.LevelNow()
+    local okH, has, readyIn = try(ns.Travel.HearthState)
+    if okH then data.hearth = { has = has, readyIn = readyIn } end
+    local summary = string.format("graveyards here %d (+%d learned); %d quest drops, %d mob cells; %s; %d to watch for, %d profession unlocks, %d group quests left out",
+        data.graveyardsHere, data.graveyardsLearned, data.questDropsIndexed, cells,
+        data.grindStop and "grind stop planned" or "no grind stop", #data.watchFor, #data.skillUnlocks, data.groupSkipped)
+    if data.graveyardApi and data.graveyardsHere == 0 and data.graveyardsLearned == 0 then
+        return "warn", summary .. " - the game lists no graveyards here, so the die-and-res tip waits until you've released at one", data
+    end
+    return "info", summary, data
 end)
 
 check("questitems", "4. Quest items (GetQuestLogSpecialItemInfo, bag quest info)", function(ctx)
@@ -1036,8 +1152,10 @@ check("flights", "12. Flight paths and hearthstone", function(ctx)
     return "ok", summary, data
 end)
 
-check("mappins", "Minimap / world map boxes (HereBeDragons)", function(ctx)
-    local data = { worldMarks = ns.db.worldMarks, pinsPlaced = ns.WorldMarks.PinCount() }
+check("mappins", "Minimap / world map squares (HereBeDragons)", function(ctx)
+    local data = { worldMarks = ns.db.worldMarks, minimapSquares = ns.db.minimapSquares,
+                   worldMapSquares = ns.db.worldMapSquares, squareSize = ns.db.squareSize,
+                   pinsPlaced = ns.WorldMarks.PinCount(), pinsShown = ns.WorldMarks.pinsShown }
     local install = "install the HereBeDragons library from CurseForge (Questie's copy is private to Questie)"
     if not LibStub then return "fail", "LibStub is missing; " .. install, data end
     local okP, pins, minor = pcall(LibStub, "HereBeDragons-Pins-2.0", true)
@@ -1045,8 +1163,40 @@ check("mappins", "Minimap / world map boxes (HereBeDragons)", function(ctx)
     local okH, hbd, hbdMinor = pcall(LibStub, "HereBeDragons-2.0", true)
     data.hbdLib, data.hbdMinor = okH and hbd ~= nil, okH and hbdMinor or nil
     if not data.pinsLib then return "fail", "HereBeDragons-Pins-2.0 not found; " .. install, data end
-    if not ns.db.worldMarks then return "skip", "world marks are off (/ladder marks)", data end
-    return "ok", string.format("HereBeDragons-Pins %s; %d boxes placed for this step", str(data.pinsMinor), data.pinsPlaced), data
+    if not (ns.db.minimapSquares or ns.db.worldMapSquares) then
+        return "skip", "map squares are off (/ladder minimap, /ladder worldmap)", data
+    end
+    return "ok", string.format("HereBeDragons-Pins %s; %d squares placed for this step", str(data.pinsMinor), data.pinsPlaced), data
+end)
+
+check("options", "13. Options window, icon and add-on menu", function(ctx)
+    local O, T = ns.Options, ns.Theme
+    local custom = {}
+    for _, role in ipairs(T.ROLES) do
+        if T.IsCustom(role.key) then custom[#custom + 1] = role.key end
+    end
+    local data = {
+        settingsApi = type(Settings) == "table" and Settings.RegisterCanvasLayoutCategory ~= nil,
+        registered = O.category ~= nil, categoryId = O.CategoryId(), reason = O.reason,
+        pagesBuilt = 0, pages = #O.PAGES,
+        colorPicker = type(ColorPickerFrame) == "table" and ColorPickerFrame.SetupColorPickerAndShow ~= nil,
+        addonMenu = O.InAddonMenu(),
+        tocIcon = value((C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata, ns.ADDON, "IconTexture"),
+        tocAddonMenu = value((C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata, ns.ADDON, "AddonCompartmentFunc"),
+        theme = T.Preset().key, customColors = custom, compact = ns.db.compact, width = ns.UI and ns.UI.Width(),
+        scale = ns.db.guideScale, bgAlpha = ns.db.bgAlpha,
+    }
+    for _, f in ipairs(O.frames) do
+        if f.built then data.pagesBuilt = data.pagesBuilt + 1 end
+    end
+    local summary = string.format("options page %s (id %s, %d/%d pages opened); theme %s%s; compact %s; color picker %s; add-on menu %s",
+        data.registered and "registered" or "NOT registered", str(data.categoryId), data.pagesBuilt, data.pages,
+        data.theme, (#custom > 0) and (" + your " .. table.concat(custom, ", ")) or "", data.compact and "on" or "off",
+        data.colorPicker and "yes" or "no", (data.addonMenu == nil) and "not in this client" or (data.addonMenu and "listed" or "NOT listed"))
+    if not data.settingsApi then return "fail", "no Blizzard Settings API: use the /ladder commands instead; " .. summary, data end
+    if not data.registered then return "fail", summary .. " (" .. str(O.reason) .. ")", data end
+    if not data.colorPicker or data.addonMenu == false then return "warn", summary, data end
+    return "ok", summary, data
 end)
 
 check("hints", "Hint box", function(ctx)
@@ -1156,11 +1306,17 @@ function Diag.Busy()
     return nil
 end
 
+--- Prints a finished run and tells the rest of the add-on (the options offer to reload).
+local function finish(run)
+    Diag.Print(run)
+    ns.Fire("DIAG_DONE", run)
+end
+
 local waiting = false
 local function runWhenSettled(arg)
     local reason = Diag.Busy()
     if not reason or not (C_Timer and C_Timer.After) then
-        Diag.Print(Diag.Run(arg))
+        finish(Diag.Run(arg))
         return
     end
     if waiting then ns.Print("diag: already waiting for the route to settle") return end
@@ -1178,7 +1334,7 @@ local function runWhenSettled(arg)
         local run = Diag.Run(arg)
         run.waited = waited
         if still then run.gaveUpWaiting = still end
-        Diag.Print(run)
+        finish(run)
     end
     C_Timer.After(Diag.WAIT_STEP, poll)
 end
@@ -1190,6 +1346,6 @@ ns.On("RUN_DIAG", function(arg)
         ns.Print("diag history cleared")
         return
     end
-    if arg:lower() == "now" then Diag.Print(Diag.Run("")) return end -- don't wait for the route
+    if arg:lower() == "now" then finish(Diag.Run("")) return end -- don't wait for the route
     runWhenSettled(arg)
 end)

@@ -219,7 +219,20 @@ local function enrichActive(sq, player, pois)
     local tag = sq.tag
     q.dungeon = anyInstanceOnly or (tag and (tag.tagID == 81 or tag.tagID == 62)) or false
     q.group = (sq.suggestedGroup or 0) > 1 or (tag and tag.tagID == 1) or false
+    Ladder.MarkSpeedFacts(q, player)
     return q
+end
+
+--- 0.5.0: an escort's walking time counts in the "worth the walk" check, and objectives against
+--- elites at your level are marked (Speed: "Escorts and group quests").
+function Ladder.MarkSpeedFacts(q, player)
+    local Speed = ns.Speed
+    if not Speed then return end
+    if q.escort then q.extraSeconds = Speed.ESCORT_SECONDS end
+    for _, o in ipairs(q.objectives or {}) do
+        o.elite = Speed.EliteTarget(o, player.level, player.faction) ~= nil or nil
+    end
+    q.groupMob, q.groupLevel = Speed.NeedsGroup(q, player.level, player.faction)
 end
 
 local function dbObjectives(db, ref, home, faction)
@@ -290,6 +303,7 @@ local function enrichCandidate(qid, pickupPoint, player)
     c.turnin = Geo.Nearest(pts, centroid(objectives) or pickupPoint)
     c.turninName = (c.turnin and c.turnin.giverName) or names[1]
     c.questItems = questItemList(db, objectives)
+    if player then Ladder.MarkSpeedFacts(c, player) end
     return c
 end
 
@@ -440,6 +454,8 @@ local function buildCandidates(player, activeList, state)
     local near = Ladder.StartersAround(Ladder.SearchAnchors(player, activeList), opts.pickupRadius)
     local checked = 0
     Ladder.skippedLowValue = {}
+    Ladder.skippedGroup = {}
+    Ladder.skillUnlocks = {}
     local whyOf = {}
     local function worth(qid, db)
         local ok, ratio, why = Ladder.WorthDoing(qid, player)
@@ -450,18 +466,42 @@ local function buildCandidates(player, activeList, state)
         whyOf[qid] = why
         return ok
     end
+    -- 0.5.0: a quest against elites at your level needs a group; solo, it's left out unless it's a
+    -- class quest, a gear upgrade or a must-do extra (/ladder groupquests plans them)
+    local function soloOk(c)
+        if not c.groupMob or not opts.skipGroupQuests then return true end
+        if whyOf[c.id] == "class" or whyOf[c.id] == "upgrade" or whyOf[c.id] == "goodie" or Ladder.KeepReason(c.id, player) then
+            return true
+        end
+        if #Ladder.skippedGroup < 20 then
+            Ladder.skippedGroup[#Ladder.skippedGroup + 1] = { id = c.id, title = c.title, mob = c.groupMob, level = c.groupLevel }
+        end
+        return false
+    end
     for _, e in ipairs(near) do
         if #out >= maxC or checked > 250 then break end
         local qid = e.questId
         if not planned[qid] and not ns.charDB.ignored[qid] then
             checked = checked + 1
             local db = Data.Quest(qid)
-            if db and levelOk(db, player, green, opts.levelsAbove) and Data.IsAvailableNow(qid, state) and worth(qid, db) then
-                local c = enrichCandidate(qid, e.point, player)
-                if c and not (opts.skipDungeonQuests and c.dungeon)
-                    and not (opts.skipEscortsAndElites and c.escort) then
-                    out[#out + 1] = c
-                    planned[qid] = true
+            if db and levelOk(db, player, green, opts.levelsAbove) then
+                if Data.IsAvailableNow(qid, state) then
+                    if worth(qid, db) then
+                        local c = enrichCandidate(qid, e.point, player)
+                        if c and not (opts.skipDungeonQuests and c.dungeon)
+                            and not (opts.skipEscortsAndElites and c.escort) and soloOk(c) then
+                            out[#out + 1] = c
+                            planned[qid] = true
+                        end
+                    end
+                elseif ns.Speed and #Ladder.skillUnlocks < ns.Speed.SKILL_UNLOCKS_MAX then
+                    -- 0.5.0: only a profession you can learn in a minute keeps you from it
+                    local skillId, skill = ns.Speed.SkillUnlock(qid, db, state)
+                    if skillId and Ladder.WorthDoing(qid, player) then
+                        local _, xp = Ladder.QuestWorth(qid, player.level)
+                        Ladder.skillUnlocks[#Ladder.skillUnlocks + 1] = { questId = qid, title = db.name, skillId = skillId,
+                                                                          skill = skill, xp = xp, point = e.point }
+                    end
                 end
             end
         end
@@ -489,7 +529,7 @@ local function buildCandidates(player, activeList, state)
                         local d = start and Geo.Distance(from, start)
                         if start and d and d <= opts.pickupRadius * 1.5 then
                             local c = enrichCandidate(fq, start, player)
-                            if c and not (opts.skipDungeonQuests and c.dungeon) then
+                            if c and not (opts.skipDungeonQuests and c.dungeon) and soloOk(c) then
                                 -- depend on every planned prerequisite, not just the parent
                                 c.after = {}
                                 for _, pre in ipairs(db.preSingle or db.preGroup or {}) do
@@ -907,10 +947,16 @@ function Ladder.Rebuild(reason)
         plan.candidates = candidates
         plan.nextArea = nextArea
         plan.skippedLowValue = Ladder.skippedLowValue
+        plan.skippedGroup = Ladder.skippedGroup
+        plan.skillUnlocks = Ladder.skillUnlocks
         -- Forever extras worked out once per plan (the hint box reads them every second)
         if ns.Goodies and Data.ready then
             plan.bagToBuy = ns.Goodies.BagToBuy(player)
             plan.cozyStart = ns.Goodies.CozyStart(player, byId, state)
+        end
+        -- 0.5.0: named mobs near the route whose drop starts a quest worth doing
+        if ns.Speed and Data.ready and ns.db.includeUnstarted then
+            plan.watchFor = ns.Speed.WatchFor(plan, player, state, byId)
         end
         plan.active = active
         plan.builtAt = GetTime and GetTime() or 0
@@ -1030,6 +1076,16 @@ function Ladder.AddTravelStops(plan, player, net, cost, bags, logCount, logMax)
         end
     end
 
+    -- 3b) 0.5.0: grind here first when the plan would send you on under-levelled
+    plan.grindStop = nil
+    if ns.Speed and player.level < maxPlayerLevel() then
+        local k, task = ns.Speed.GrindStop(plan, player)
+        if k then
+            plan.steps = Travel.WithInserted(plan.steps, k, stopStep(task))
+            plan.grindStop = task
+        end
+    end
+
     -- 4) Which legs to fly, and the hearth steps' notes.
     Travel.AnnotateSteps(plan.steps, start, ns.db.useFlights and net or { nodes = {}, speed = net.speed })
 
@@ -1060,6 +1116,17 @@ function Ladder.LiveTravel(step, here)
         local d = Geo.Distance(here, o.zeppelin.from.point)
         out.atTower = d ~= nil and d <= ns.Travel.ZEPPELIN_TOWER_YARDS
     end
+    -- 0.5.0: or die on purpose, when the graveyard you'd appear at is next to where you're going
+    local Speed = ns.Speed
+    if Speed and ns.db.deathTravel and o.walkable then
+        local best = (out.mode == "fly" and out.fly and out.fly.total)
+            or (out.mode == "zeppelin" and out.zeppelin and out.zeppelin.total) or out.walk
+        if best and best >= Speed.DEATH_MIN_WAY then
+            local level = (plan.player and plan.player.level) or 1
+            local die = Speed.DeathOption(plan.net, here, step.loc, level, Speed.CalmSeconds(plan, step.index, plan.net))
+            if Speed.DeathWorthIt(die, best) then out.die, out.dieVs = die, best end
+        end
+    end
     return out
 end
 
@@ -1068,6 +1135,15 @@ local function clock(seconds)
     return string.format("%d:%02d", math.floor(seconds / 60), seconds % 60)
 end
 Ladder.Clock = clock
+
+--- "5:10 of travel", or with an escort "1:10 of travel and 4:00 of escorting".
+function Ladder.TripTimeText(p)
+    local extra = p.extra or 0
+    if extra <= 0 then return clock(p.seconds) .. " of travel" end
+    local travel = math.max(0, (p.seconds or 0) - extra)
+    if travel < 1 then return clock(extra) .. " of escorting" end
+    return string.format("%s of travel and %s of escorting", clock(travel), clock(extra))
+end
 
 --- /ladder skipped: the new quests the plan leaves out, and why. Returns the lines (for tests).
 function Ladder.SkippedLines(plan)
@@ -1080,11 +1156,19 @@ function Ladder.SkippedLines(plan)
         lines[#lines + 1] = string.format("Not worth the walk from here (%d):", #pruned)
         for _, p in ipairs(pruned) do
             local grind = level and ns.Planner.GrindRate(level) * (p.seconds or 0)
-            lines[#lines + 1] = string.format("  %s - %s XP%s, but adds %s of travel (killing mobs that long gives ~%s XP)",
+            lines[#lines + 1] = string.format("  %s - %s XP%s, but adds %s (killing mobs that long gives ~%s XP)",
                 tostring(p.title or p.questId), p.xp and tostring(math.floor(p.xp + 0.5)) or "?",
                 (p.together or 1) > 1 and string.format(" (%d quests out there together: %d XP)", p.together,
                     math.floor((p.groupXP or 0) + 0.5)) or "",
-                clock(p.seconds), grind and tostring(math.floor(grind + 0.5)) or "?")
+                Ladder.TripTimeText(p), grind and tostring(math.floor(grind + 0.5)) or "?")
+        end
+    end
+    local group = plan.skippedGroup or {}
+    if #group > 0 then
+        lines[#lines + 1] = string.format("Needs a group (%d) - /ladder groupquests plans them:", #group)
+        for _, s in ipairs(group) do
+            lines[#lines + 1] = string.format("  %s - %s%s is elite", tostring(s.title or s.id), tostring(s.mob or "its target"),
+                s.level and (" (lvl " .. s.level .. ")") or "")
         end
     end
     local outgrown = plan.outgrown or {}
@@ -1159,8 +1243,8 @@ function Ladder.QuestVerdict(questId)
     end
     for _, p in ipairs((plan and plan.pruned) or {}) do
         if p.questId == questId then
-            return false, string.format("not worth the walk: %s XP for %s of travel", p.xp and tostring(math.floor(p.xp + 0.5)) or "?",
-                clock(p.seconds)), title
+            return false, string.format("not worth the walk: %s XP for %s", p.xp and tostring(math.floor(p.xp + 0.5)) or "?",
+                Ladder.TripTimeText(p)), title
         end
     end
     for _, s in ipairs((plan and plan.skippedLowValue) or {}) do
@@ -1172,6 +1256,17 @@ function Ladder.QuestVerdict(questId)
         return false, "its objectives are inside a dungeon (/ladder dungeons plan to plan those)", title
     end
     if opts.skipEscortsAndElites and isEscort(db) then return false, "an escort or elite quest", title end
+    for _, s in ipairs((plan and plan.skippedGroup) or {}) do
+        if s.id == questId then
+            return false, string.format("needs a group: %s%s is elite (/ladder groupquests plans these)", tostring(s.mob or "its target"),
+                s.level and (" (lvl " .. s.level .. ")") or ""), title
+        end
+    end
+    for _, u in ipairs((plan and plan.skillUnlocks) or {}) do
+        if u.questId == questId then
+            return false, string.format("needs %s: learn it at a %s trainer first", u.skill, u.skill), title
+        end
+    end
     if plan and plan.logCount and plan.logMax and plan.logCount >= plan.logMax then
         return false, string.format("your quest log is full (%d/%d) - /ladder outgrown says what to drop", plan.logCount, plan.logMax), title
     end
@@ -1321,6 +1416,7 @@ local function taskDone(t, byId)
         return false
     elseif t.kind == "visit" then
         if t.done then return true end
+        if t.visit == "grind" then return ns.Speed ~= nil and ns.Speed.ReachedLevel(t.targetLevel) end
         if t.visit == "flight" then
             local known = ns.charDB.flightPaths and t.nodeName and ns.charDB.flightPaths[t.nodeName]
             local knownNpc = ns.charDB.knownTaxiNpc and t.npcId and ns.charDB.knownTaxiNpc[t.npcId]
@@ -1413,6 +1509,24 @@ function Ladder.WaypointTarget(step, here)
     return step.loc
 end
 
+--- 0.4.1: the arrow to Blizzard's map pin is the game's "In-Game Navigation" marker, and on clients
+--- that have the setting (CVar showInGameNavigation) it can be off. Then the pin is on the map with
+--- no arrow on screen. Forever's settings don't offer it and the game reports no such CVar, so
+--- there this never speaks up. TomTom's arrow doesn't depend on it.
+function Ladder.InGameNavigationOff()
+    local get = (C_CVar and C_CVar.GetCVar) or GetCVar
+    local ok, value = pcall(get, "showInGameNavigation")
+    return ok and not ns.IsSecret(value) and value == "0" or false
+end
+
+--- Say so once per session, the first time a pin goes on the map (nothing is changed for you).
+function Ladder.NoticeNoArrow()
+    if Ladder.toldNoArrow or not Ladder.InGameNavigationOff() then return end
+    Ladder.toldNoArrow = true
+    ns.Print("the game's In-Game Navigation setting is off, so the map pin has no arrow on screen. "
+        .. "Type /console showInGameNavigation 1 to turn it on (or install TomTom for its arrow)")
+end
+
 --- 0.3.29: a pin somewhere other than the current step, from clicking a hint line (where the
 --- Cozy Sleeping Bag chain starts, a bag vendor, the riding trainer). Same pin as the route's:
 --- the map's own waypoint with its arrow, or a TomTom arrow. The route's pin comes back when you
@@ -1438,6 +1552,10 @@ function Ladder.PinTo(loc, title)
     local ok = pcall(C_Map.SetUserWaypoint, point)
     if ok and C_SuperTrack and C_SuperTrack.SetSuperTrackedUserWaypoint then
         pcall(C_SuperTrack.SetSuperTrackedUserWaypoint, true)
+    end
+    if ok then
+        Ladder.NoticeNoArrow()
+        Ladder.OurPinPlaced(loc)
     end
     return ok
 end
@@ -1475,12 +1593,96 @@ function Ladder.UpdateWaypoint()
     end
     if C_Map and C_Map.SetUserWaypoint and UiMapPoint and UiMapPoint.CreateFromCoordinates then
         if C_Map.CanSetUserWaypointOnMap and not C_Map.CanSetUserWaypointOnMap(loc.mapId) then return end
-        pcall(C_Map.SetUserWaypoint, UiMapPoint.CreateFromCoordinates(loc.mapId, loc.x, loc.y))
+        local ok = pcall(C_Map.SetUserWaypoint, UiMapPoint.CreateFromCoordinates(loc.mapId, loc.x, loc.y))
         if C_SuperTrack and C_SuperTrack.SetSuperTrackedUserWaypoint then
             pcall(C_SuperTrack.SetSuperTrackedUserWaypoint, true)
         end
+        if ok then
+            Ladder.NoticeNoArrow()
+            Ladder.OurPinPlaced(loc)
+        end
     end
 end
+
+---------------------------------------------------------------------------
+-- 0.5.0: unhide Blizzard's arrow to Quest Ladder's pin
+---------------------------------------------------------------------------
+-- On Forever, Blizzard's navigation rated a pin 5,300 yards away "Invalid", and its arrow frame
+-- (SuperTrackedFrame) draws an Invalid target fully see-through, although the frame was placed,
+-- on screen, and its edge arrow pointed the right way (diag 2026-11-22; the user's own pin too).
+-- The user chose to have Quest Ladder show it, for the pins Quest Ladder places: a hook that runs
+-- after the frame's own UpdateAlpha (hooksecurefunc: Blizzard's code and values stay untouched)
+-- makes it visible while the target is rated Invalid, has a screen position, and the tracked pin
+-- is ours. The user's own pins and tracked quests look as Blizzard draws them. /ladder arrow
+-- turns it off. Display only.
+Ladder.lastPin, Ladder.ourPinTracked, Ladder.arrowHooked = nil, false, false
+Ladder.PIN_SAME = 0.002
+
+--- The user waypoint as plain numbers: mapId, x, y (nil when there is none or it's secret).
+local function userWaypoint()
+    if not (C_Map and C_Map.GetUserWaypoint) then return nil end
+    local ok, wp = pcall(C_Map.GetUserWaypoint)
+    if not ok or type(wp) ~= "table" or ns.IsSecret(wp) then return nil end
+    local pos, x, y = wp.position, nil, nil
+    if type(pos) == "table" and not ns.IsSecret(pos) then
+        if pos.GetXY then
+            local okXY, px, py = pcall(pos.GetXY, pos)
+            if okXY then x, y = px, py end
+        else
+            x, y = pos.x, pos.y
+        end
+    end
+    if ns.AnySecret(wp.uiMapID, x, y) or type(x) ~= "number" or type(y) ~= "number" then return nil end
+    return wp.uiMapID, x, y
+end
+
+--- Is the tracked pin the one Quest Ladder placed last? (re-checked when the pin or tracking changes)
+function Ladder.RefreshOurPin()
+    local pin, tracked = Ladder.lastPin, false
+    if pin then
+        local mapId, x, y = userWaypoint()
+        if mapId == pin.mapId and math.abs(x - pin.x) < Ladder.PIN_SAME and math.abs(y - pin.y) < Ladder.PIN_SAME
+            and C_SuperTrack and C_SuperTrack.IsSuperTrackingUserWaypoint then
+            local okT, t = pcall(C_SuperTrack.IsSuperTrackingUserWaypoint)
+            tracked = okT and not ns.IsSecret(t) and t == true
+        end
+    end
+    Ladder.ourPinTracked = tracked
+    return tracked
+end
+
+function Ladder.OurPinPlaced(loc)
+    Ladder.lastPin = { mapId = loc.mapId, x = loc.x, y = loc.y }
+    Ladder.HookNavigationArrow()
+    Ladder.RefreshOurPin()
+end
+
+--- Runs after Blizzard's arrow frame sets its alpha.
+function Ladder.ArrowAlphaHook(frame)
+    if not (ns.db.unhideArrow and Ladder.ourPinTracked and C_Navigation and C_Navigation.GetTargetState) then return end
+    local invalid = (Enum and Enum.NavigationState and Enum.NavigationState.Invalid) or 0
+    local okS, state = pcall(C_Navigation.GetTargetState)
+    if not okS or ns.IsSecret(state) or state ~= invalid then return end
+    if C_Navigation.HasValidScreenPosition then
+        local okV, onScreen = pcall(C_Navigation.HasValidScreenPosition)
+        if not okV or ns.IsSecret(onScreen) or onScreen ~= true then return end
+    end
+    if type(frame) == "table" and frame.SetAlpha then pcall(frame.SetAlpha, frame, 1) end
+end
+
+function Ladder.HookNavigationArrow()
+    if Ladder.arrowHooked then return true end
+    local f = _G.SuperTrackedFrame
+    if type(f) ~= "table" or type(f.UpdateAlpha) ~= "function" or not hooksecurefunc then return false end
+    Ladder.arrowHooked = pcall(hooksecurefunc, f, "UpdateAlpha", Ladder.ArrowAlphaHook) and true or false
+    return Ladder.arrowHooked
+end
+
+ns.RegisterEvent("USER_WAYPOINT_UPDATED", function() Ladder.RefreshOurPin() end)
+ns.RegisterEvent("SUPER_TRACKING_CHANGED", function() Ladder.RefreshOurPin() end)
+ns.RegisterEvent("ADDON_LOADED", function(_, name)
+    if name == "Blizzard_QuestNavigation" then Ladder.HookNavigationArrow() end
+end)
 
 ---------------------------------------------------------------------------
 -- Text for the UI
@@ -1542,8 +1744,8 @@ function Ladder.TaskText(t)
         end
         if o.mobLevel then
             local lvl = Ladder.plan and Ladder.plan.player and Ladder.plan.player.level
-            local color = (lvl and o.mobLevel >= lvl + 2) and "|cffff8800" or "|cff888888"
-            where = where .. string.format(" %s(lvl %d)|r", color, o.mobLevel)
+            local color = ((lvl and o.mobLevel >= lvl + 2) or o.elite) and "|cffff8800" or "|cff888888"
+            where = where .. string.format(" %s(lvl %d%s)|r", color, o.mobLevel, o.elite and " elite" or "")
         end
         if not t.loc then where = where .. " |cffff8800(location unknown)|r" end
         return text .. where .. "  |cff888888" .. title .. "|r"
@@ -1618,6 +1820,7 @@ local function onLogUpdate()
 end
 
 ns.On("LOGIN", function()
+    Ladder.HookNavigationArrow()
     if not Data.Init() then
         Ladder.status = Data.reason
         ns.Print("|cffff4444%s|r", Data.reason or "QuestieDB unavailable")
@@ -1703,6 +1906,10 @@ ns.RegisterEvent("MERCHANT_SHOW", function()
     onLogUpdate()
 end)
 ns.On("TAXI_LEARNED", onLogUpdate)
+-- 0.5.0: a "Grind first" stop ends when the bar gets there
+ns.RegisterEvent("PLAYER_XP_UPDATE", function()
+    if Ladder.plan and Ladder.plan.grindStop and not Ladder.plan.grindStop.isDone then onLogUpdate() end
+end)
 ns.On("REQUEST_REPLAN", function(reason)
     if reason == "bind changed" and Ladder.plan and Ladder.plan.byId["V:bind"] then
         Ladder.plan.byId["V:bind"].done = true

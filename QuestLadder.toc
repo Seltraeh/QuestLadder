@@ -2,7 +2,7 @@
 ## Title: Quest Ladder
 ## Notes: Step-by-step questing guide for WoW: Forever: optimized quest route, "don't forget" hints, bag-space planner and gear upgrades (quest rewards + Auctionator).
 ## Author: Seltraeh
-## Version: 0.4.0
+## Version: 0.6.0
 ## X-License: MIT
 ## X-Website: https://github.com/Seltraeh/QuestLadder
 ## Category: Quests
@@ -10,9 +10,13 @@
 ## OptionalDeps: Questie, Auctionator, TomTom, HereBeDragons, BagBrother, Bagnon, Baganator
 ## SavedVariables: QuestLadderDB, QuestLadderDiag
 ## SavedVariablesPerCharacter: QuestLadderCharDB
-## IconTexture: Interface\Icons\INV_Misc_Map_01
+## IconTexture: Interface\AddOns\QuestLadder\Media\Icon
+## AddonCompartmentFunc: QuestLadder_OnAddonCompartmentClick
+## AddonCompartmentFuncOnEnter: QuestLadder_OnAddonCompartmentEnter
+## AddonCompartmentFuncOnLeave: QuestLadder_OnAddonCompartmentLeave
 
 Core.lua
+Theme.lua
 Geo.lua
 Data.lua
 QuestState.lua
@@ -23,8 +27,10 @@ Bags.lua
 Hints.lua
 Ladder.lua
 Goodies.lua
+Speed.lua
 Automation.lua
 Highlight.lua
 WorldMarks.lua
 UI.lua
+Options.lua
 Diag.lua
