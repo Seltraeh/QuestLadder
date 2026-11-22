@@ -2,7 +2,7 @@
 --
 -- WoW does not let add-ons draw on 3D objects the way RuneLite can, so this uses the hooks the
 -- game does offer:
---   * NPCs: a cyan box + label on their nameplate (quest mobs, quest givers, turn-ins)
+--   * NPCs: a cyan box on their nameplate with a label under it (quest mobs, quest givers, turn-ins)
 --   * Objects (books, crates, herbs, ore): Blizzard's soft-target system tells us what you are
 --     facing; when it is the objective you get a "this one" cue, and the nameplate the game
 --     shows for that object gets the box. /ladder interacticons turns on Blizzard's own icons
@@ -129,7 +129,8 @@ local function newMark(plate)
         if spec[3] then t:SetHeight(2) else t:SetWidth(2) end
     end
     m.label = m:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    m.label:SetPoint("BOTTOM", m, "TOP", 0, 2)
+    -- under the box: the mob's name sits right above its health bar, and a label there covered it
+    m.label:SetPoint("TOP", m, "BOTTOM", 0, -2)
     m.label:SetTextColor(CYAN_R, CYAN_G, CYAN_B)
     plate.QuestLadderMark = m
     return m
@@ -190,6 +191,22 @@ local function safeName(unit)
     return nil
 end
 
+--- What you've selected: your target and what you're facing (soft target), as
+--- { kind = "Creature"|"GameObject"|..., id, name }. Used by the use button (Hints.UseReady),
+--- so it works with world markers off too. Secret GUIDs are skipped.
+function WM.Selected()
+    local out = {}
+    for _, unit in ipairs({ "target", "softinteract" }) do
+        local ok, guid = pcall(UnitGUID, unit)
+        if ok then
+            local kind, id = WM.ParseGUID(guid)
+            if id then out[#out + 1] = { kind = kind, id = id, name = safeName(unit), unit = unit } end
+        end
+    end
+    return out
+end
+
+local lastSoftStep = false
 ns.RegisterEvent("PLAYER_SOFT_INTERACT_CHANGED", function(_, _, newGuid)
     local label = ns.db.worldMarks and lookup(newGuid)
     local was = WM.softHit
@@ -199,7 +216,10 @@ ns.RegisterEvent("PLAYER_SOFT_INTERACT_CHANGED", function(_, _, newGuid)
     else
         WM.softHit = nil
     end
-    if (was ~= nil) ~= (WM.softHit ~= nil) then ns.Fire("HINTS_CHANGED") end
+    -- facing (or turning away from) one of this step's targets can bring up the use button
+    local onStep = lookup(newGuid) ~= nil
+    if (was ~= nil) ~= (WM.softHit ~= nil) or onStep ~= lastSoftStep then ns.Fire("HINTS_CHANGED") end
+    lastSoftStep = onStep
 end)
 
 --- Re-checks what you target and face against the current step's targets. Called when you
@@ -220,14 +240,16 @@ ns.RegisterEvent("PLAYER_TARGET_CHANGED", function()
     ns.Fire("HINTS_CHANGED")
 end)
 
---- Hints for the hint box (called from Hints.Compute).
-function WM.Hints(push)
-    if WM.softHit then
+--- Hints for the hint box (called from Hints.Compute). `covered` names the cues ("target",
+--- "softinteract") a use-item line already gives: you use an item on that, you don't interact.
+function WM.Hints(push, covered)
+    covered = covered or {}
+    if WM.softHit and not covered.softinteract then
         push({ priority = 99, kind = "info",
                text = string.format("|cff00ffff>> This one:|r %s%s - press your Interact key",
                    WM.softHit.label, WM.softHit.name and (" " .. WM.softHit.name) or "") })
     end
-    if WM.targetHit then
+    if WM.targetHit and not covered.target then
         push({ priority = 64, kind = "info",
                text = string.format("|cff00ffffTarget is right:|r %s %s", WM.targetHit.label, WM.targetHit.name or "") })
     end

@@ -127,14 +127,25 @@ local function travelLine(step)
     return Ladder.TravelText(step, live), live
 end
 
+--- Countdown lines for timed quests (Ladder.TimerText), redrawn every second by the ticker.
+local shownTimers
+local function timerText()
+    local out = {}
+    for _, e in ipairs(Ladder.TimedQuests()) do out[#out + 1] = Ladder.TimerText(e) end
+    return table.concat(out, " | "), out
+end
+
 local function layoutGuide()
     local plan = Ladder.plan
     local step = Ladder.CurrentStep()
     local y = guide.distance:GetStringHeight() + guide.header:GetStringHeight() + 34
     local anchor = guide.distance
 
-    -- current step: travel line (fly / walk / hearth) first, then tasks
+    -- a timed quest's countdown first, then the current step: travel line (fly / walk / hearth), tasks
     local lines = {}
+    local timers, timerList = timerText()
+    shownTimers = timers
+    for _, l in ipairs(timerList) do lines[#lines + 1] = l end
     local travel = travelLine(step)
     shownTravel = travel
     if travel then lines[#lines + 1] = travel end
@@ -254,7 +265,9 @@ function UI.RefreshGuide()
         guide.header:SetText(Ladder.status or "Planning...")
     elseif not step then
         guide.counter:SetText("")
-        guide.header:SetText("Nothing left to plan here - press Replan after moving to a new area")
+        guide.header:SetText(plan.nextArea
+            and ("Nothing worth doing left here. Next area: " .. Ladder.NextAreaText(plan.nextArea))
+            or "Nothing left to plan here - press Replan after moving to a new area")
     else
         guide.counter:SetText(string.format("step %d/%d", Ladder.current, #plan.steps))
         guide.header:SetText(Ladder.StepTitle(step))
@@ -276,8 +289,29 @@ local function buildHints()
     hintFrame:SetSize(WIDTH, 40)
     hintFrame:SetPoint("TOPLEFT", guide, "BOTTOMLEFT", 0, -4)
     hintFrame.lines = {}
+    hintFrame.hits = {}
     for i = 1, MAX_HINT_LINES do
-        hintFrame.lines[i] = fontString(hintFrame, "GameFontHighlight", WIDTH - 20)
+        local fs = fontString(hintFrame, "GameFontHighlight", WIDTH - 20)
+        hintFrame.lines[i] = fs
+        -- 0.3.29: a line that names a place (the Cozy Sleeping Bag start, a bag vendor) can be
+        -- clicked for a map pin. A plain button over the line: no secure code, works in combat.
+        local hit = CreateFrame("Button", nil, hintFrame)
+        hit:SetPoint("TOPLEFT", fs, "TOPLEFT", 0, 0)
+        hit:SetPoint("BOTTOMRIGHT", fs, "BOTTOMRIGHT", 0, 0)
+        hit:RegisterForClicks("LeftButtonUp")
+        hit:SetScript("OnClick", function(self) Ladder.PinHint(self.hint) end)
+        hit:SetScript("OnEnter", function(self)
+            local pin = self.hint and self.hint.pin
+            if not pin then return end
+            GameTooltip:SetOwner(self, "ANCHOR_TOP")
+            GameTooltip:AddLine("Quest Ladder: click for a map pin", 0.2, 1, 0.6)
+            GameTooltip:AddLine((pin.title or "") .. ((ns.Goodies and ns.Goodies.PlaceText(pin)) and
+                ("  " .. ns.Goodies.PlaceText(pin)) or ""), 1, 1, 1)
+            GameTooltip:Show()
+        end)
+        hit:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        hit:Hide()
+        hintFrame.hits[i] = hit
     end
 
     -- The secure button lives on UIParent (not inside our frames) so our own frames never
@@ -337,9 +371,10 @@ function UI.RefreshHints()
         local y, anchor = 8, nil
         for i = 1, MAX_HINT_LINES do
             local fs = hintFrame.lines[i]
+            local hit = hintFrame.hits and hintFrame.hits[i]
             local h = list[i]
             if h then
-                fs:SetText(h.text)
+                fs:SetText(h.text .. (h.pin and " |cff888888(click for a map pin)|r" or ""))
                 fs:ClearAllPoints()
                 if anchor then fs:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -4)
                 else fs:SetPoint("TOPLEFT", 10, -8) end
@@ -348,6 +383,10 @@ function UI.RefreshHints()
                 y = y + fs:GetStringHeight() + 4
             else
                 fs:Hide()
+            end
+            if hit then
+                hit.hint = h
+                if h and h.pin then hit:Show() else hit:Hide() end
             end
         end
         hintFrame:SetHeight(y + 6)
@@ -474,7 +513,7 @@ local function showGear(scanned)
     local player = ns.QuestState.Player()
     local budget = ns.Gear.Budget(player)
     panel.status:SetText(string.format("Spending money: %s (keeping %s for training). %s",
-        ns.FormatMoney(budget), ns.FormatMoney(ns.Gear.Reserve(player.level)),
+        ns.FormatMoney(budget), ns.FormatMoney(ns.Gear.Reserve(player.level, player)),
         ns.Prices.HasAuctionator() and "Prices from Auctionator's last scan." or "|cffff8800Auctionator not found.|r"))
     panel.action:SetText("Find AH upgrades")
     panel.action:SetScript("OnClick", function()
@@ -576,7 +615,7 @@ local function tick()
     end
     Ladder.UpdateWaypoint()
     -- fly-or-walk is re-checked from where you stand: redraw when it changes
-    if guide:IsShown() and travelLine(step) ~= shownTravel then layoutGuide() end
+    if guide:IsShown() and (travelLine(step) ~= shownTravel or timerText() ~= shownTimers) then layoutGuide() end
     Hints.Compute({
         point = Geo.PlayerPoint(),
         byId = Ladder.snapshot or {},

@@ -23,6 +23,24 @@ function Bags.IsTool(itemId, info)
     return info ~= nil and info.classID == 2 and (info.subClassID == 14 or info.subClassID == 20)
         and (info.quality or 1) >= 1 -- a gray "broken" one is still junk
 end
+-- Crafting materials are money: cloth, leather, herbs, ore and bars, meat, elemental and
+-- enchanting materials, gems and recipes. They are never put up for "Sell" or "Destroy"; when
+-- bags are short they're suggested for the bank (or the AH). The game flags crafting reagents
+-- itself (GetItemInfo's isCraftingReagent); the item classes catch the rest.
+local MATERIAL_CLASSES = {
+    [3] = true,  -- gems
+    [5] = true,  -- reagents
+    [7] = true,  -- trade goods
+    [9] = true,  -- recipes
+}
+function Bags.IsMaterial(itemId, info)
+    if not info then return false end
+    if info.craftingReagent then return true end
+    if (info.quality or 1) == 0 then return false end -- gray: vendor trash
+    if MATERIAL_CLASSES[info.classID or -1] then return true end
+    return info.classID == 15 and info.subClassID == 1 -- miscellaneous: reagent
+end
+
 local NEVER_SUGGEST_CLASSES = {
     [0] = true,  -- consumables (food, water, potions, bandages)
     [1] = true,  -- containers
@@ -85,7 +103,14 @@ function Bags.Suggestions(bags, byId, plan)
                             name = info.name, count = s.count, value = vendor }
             -- Gear first, gray or not: at low levels a gray piece can beat what you wear (or an
             -- empty slot), and it was being sold as junk.
-            if (info.classID == 2 or info.classID == 4) and Gear.SLOTS[info.equipLoc or ""] then
+            if Bags.IsMaterial(id, info) then
+                -- crafting materials: never "Sell" or "Destroy"; the bank (or the AH) when space is short
+                if plan and plan.bags and plan.bags.needed > 0 then
+                    entry.action, entry.reason = "bank", "crafting material - bank it or sell it on the AH"
+                    if ah and ah > vendor then entry.value = ah end
+                    out[#out + 1] = entry
+                end
+            elseif (info.classID == 2 or info.classID == 4) and Gear.SLOTS[info.equipLoc or ""] then
                 local canNow = Gear.CanEquip(id, info, player, 0)
                 local canSoon = canNow or Gear.CanEquip(id, info, player, 3)
                 local up = canSoon and Gear.CompareToEquipped(entry.link, info, player.classFile, player.level)
@@ -120,7 +145,7 @@ function Bags.Suggestions(bags, byId, plan)
                     out[#out + 1] = entry
                 end
             elseif not NEVER_SUGGEST_CLASSES[info.classID or -1] and (info.quality or 0) <= 1 then
-                -- Trade goods and misc whites: only suggest when space is actually short.
+                -- Misc whites: only suggest when space is actually short.
                 if plan and plan.bags and plan.bags.needed > 0 then
                     if ah and ah > vendor then
                         entry.action, entry.reason, entry.value = "bank", "bank it or sell on the AH", ah

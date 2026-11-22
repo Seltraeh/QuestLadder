@@ -70,7 +70,7 @@ local function db()
 end
 
 local FILES = { "Core.lua", "Geo.lua", "Data.lua", "QuestState.lua", "Planner.lua", "Travel.lua", "Gear.lua",
-                "Bags.lua", "Hints.lua", "Ladder.lua", "Automation.lua", "Highlight.lua", "WorldMarks.lua" }
+                "Bags.lua", "Hints.lua", "Ladder.lua", "Goodies.lua", "Automation.lua", "Highlight.lua", "WorldMarks.lua" }
 
 local function setup(opts)
     M.installGlobals(opts)
@@ -475,11 +475,18 @@ do
         if h.text:find("start the escort") then found.extra = true end
     end
     check("bag quest-starter hint", found.starter)
-    check("special quest item hint", found.special)
+    check("special quest item: no hint while it isn't this step's quest (0.3.25)", not found.special)
     check("escort hint", found.escort)
     check("Questie extra-objective note shown", found.extra)
     local use = H.UsableItem()
-    check("use button gets a usable item", use and (use.itemId == 602 or use.itemId == 700), use and use.itemId)
+    check("use button gets the quest starter", use and use.itemId == 602, use and use.itemId)
+    -- on the step for that quest, standing at its place, the game's special item is ready to use
+    local here = Geo.Point(1429, 0.44, 0.30)
+    list = H.Compute({ point = here, byId = byId, bags = ns.QuestState.Bags(), now = M.time,
+                       step = { tasks = { { id = "T9", kind = "turnin", questId = 9, loc = here, deps = {} } } } })
+    found.special = false
+    for _, h in ipairs(list) do if h.text:find("Gnomish Tools") and h.kind == "use" and h.button then found.special = true end end
+    check("special quest item: this step's quest, at its place: on the button", found.special)
 end
 
 ---------------------------------------------------------------------------
@@ -624,7 +631,7 @@ do
     local HL = ns.Highlight
     M.items[700] = { name = "Gnomish Tools", classID = 12, spell = "Use" }
     M.bag = { { id = 700 }, { id = 600, count = 2 } }
-    ns.Hints.list = { { kind = "use", itemId = 700, text = "use it" } }
+    ns.Hints.list = { { kind = "use", itemId = 700, text = "use it", button = true } }
     local bp = M.newFrame("backpack"); bp:Show()
     _G.MainMenuBarBackpackButton = bp
     HL.Update({ bags = ns.QuestState.Bags(), suggestions = {} })
@@ -690,6 +697,12 @@ do
     WM.DecoratePlate("nameplate1")
     check("quest mob nameplate marked", plate.QuestLadderMark and plate.QuestLadderMark:IsShown()
         and plate.QuestLadderMark.label:GetText() == "Kill")
+    -- 0.3.27: the label sat above the box, over the mob's name; now it's under the box
+    local lp = plate.QuestLadderMark and plate.QuestLadderMark.label.__points
+    lp = lp and lp[#lp]
+    check("nameplate label sits under the box, clear of the mob's name",
+        lp and lp[1] == "TOP" and lp[2] == plate.QuestLadderMark and lp[3] == "BOTTOM" and (lp[5] or 0) < 0,
+        lp and table.concat({ tostring(lp[1]), tostring(lp[3]), tostring(lp[5]) }, " "))
     local other = M.newFrame("plate2")
     M.plates.nameplate2 = other
     M.guids.nameplate2 = "Creature-0-1-2-3-999-0000ABCD"
@@ -742,6 +755,46 @@ do
     M.guids.nameplate1 = "GameObject-0-1-2-3-301-0000ABCD"
     WM.DecoratePlate("nameplate1")
     check("other objects left alone", not mark:IsShown())
+    -- 0.3.27: every kind of tag sits under its box, not just "Turn in": the same label for all
+    WM.SetTargets({ tasks = {
+        { kind = "objective", obj = { type = "monster", targets = { npc = { 401 } } }, quest = {} },
+        { kind = "objective", obj = { type = "item", targets = { npc = { 402 }, object = { 501 } } }, quest = {} },
+        { kind = "objective", obj = { type = "object", targets = { object = { 502 } } }, quest = {} },
+        { kind = "objective", obj = { type = "event", targets = { npc = { 403 } } }, quest = {} },
+        { kind = "objective", obj = { type = "killcredit", targets = { npc = { 404 } } }, quest = {} },
+        { kind = "pickup", loc = { giverId = 405 }, quest = {} },
+        { kind = "turnin", loc = { giverId = 406 }, quest = {} },
+        { kind = "turnin", loc = { giverId = 407 }, quest = { useFirst = true } },
+        { kind = "turnin", loc = { giverId = -503 }, quest = {} },
+        { kind = "visit", visit = "flight", npcId = 408 }, { kind = "visit", visit = "bind", npcId = 409 },
+        { kind = "visit", visit = "vendor", npcId = 410 }, { kind = "visit", visit = "trainer", npcId = 411 },
+    } })
+    local tags = {
+        { "Creature", 401, "Kill" }, { "Creature", 402, "Loot" }, { "GameObject", 501, "Loot" },
+        { "GameObject", 502, "Use" }, { "Creature", 403, "Go" }, { "Creature", 404, "Quest" },
+        { "Creature", 405, "Accept" }, { "Creature", 406, "Turn in" }, { "Creature", 407, "Use item on" },
+        { "GameObject", 503, "Turn in" }, { "Creature", 408, "Flight path" }, { "Creature", 409, "Innkeeper" },
+        { "Creature", 410, "Vendor" }, { "Creature", 411, "Trainer" },
+    }
+    local wrong = {}
+    local reused = M.newFrame("plateR")
+    reused.UnitFrame = { name = M.newFrame("nameR"), healthBar = M.newFrame("barR") }
+    for i, tag in ipairs(tags) do
+        -- a fresh plate for each tag, and one plate the game keeps reusing for all of them
+        for _, p in ipairs({ M.newFrame("plateT" .. i), reused }) do
+            M.plates.nameplate9 = p
+            M.guids.nameplate9 = string.format("%s-0-1-2-3-%d-0000ABCD", tag[1], tag[2])
+            WM.DecoratePlate("nameplate9")
+            local mk = p.QuestLadderMark
+            local pts = mk and mk.label.__points
+            local at = pts and pts[#pts]
+            if not (mk and mk:IsShown() and mk.label:GetText() == tag[3] and at and at[1] == "TOP" and at[2] == mk
+                    and at[3] == "BOTTOM" and (at[5] or 0) < 0) then
+                wrong[#wrong + 1] = tag[3] .. " (" .. tostring(mk and mk.label:GetText()) .. ")"
+            end
+        end
+    end
+    check("every nameplate tag (Kill, Loot, Turn in, Accept, ...) sits under its box", #wrong == 0, table.concat(wrong, ", "))
     _G.LibStub = nil
 end
 
@@ -870,7 +923,7 @@ do
     local HL = ns.Highlight
     M.items[700] = { name = "Gnomish Tools", classID = 12, spell = "Use" }
     M.bag = { { id = 600 }, { id = 700 } }      -- tools in bag 0 slot 2
-    ns.Hints.list = { { kind = "use", itemId = 700, text = "use it" } }
+    ns.Hints.list = { { kind = "use", itemId = 700, text = "use it", button = true } }
     local function itemButton(bag, slot, viaParent)
         local b = M.newFrame("item"); b:Show(); b.__id = slot
         b.IsObjectType = function(_, t) return t == "ItemButton" or t == "Button" end
@@ -952,7 +1005,32 @@ do
         ns.UI.ShowPanel("bags")
         ns.UI.ShowPanel("gear")
         check("ui: guide header set", _G.QuestLadderGuideFrame and _G.QuestLadderGuideFrame.header ~= nil)
+        -- a timed quest's countdown is the guide's first line
+        local timer = { total = 300, elapsed = 0, readAt = M.time }
+        ns.Ladder.plan.active[#ns.Ladder.plan.active + 1] = { id = 99, title = "Timed One", timed = true, timer = timer,
+                                                              turninName = "Someone", objectives = {} }
+        ns.Ladder.snapshot = ns.Ladder.snapshot or {}
+        ns.Ladder.snapshot[99] = { id = 99, timer = timer }
+        ns.UI.RefreshGuide()
+        local line = _G.QuestLadderGuideFrame.tasks[1]:GetText() or ""
+        check("ui: the countdown leads the guide", line:find("Timed:", 1, true) and line:find("5:00", 1, true), line)
+        ns.Ladder.snapshot[99] = nil
         check("ui: waypoint set", M.waypoint ~= nil, "no waypoint")
+        -- 0.3.29: a hint line that names a place can be clicked for a map pin
+        ns.Hints.list = { { text = "Cozy Sleeping Bag: starts at Burned-Out Remains", kind = "info",
+                            pin = { mapId = 1429, x = 0.463, y = 0.739, title = "Burned-Out Remains" } },
+                          { text = "a plain line", kind = "info" } }
+        ns.UI.RefreshHints()
+        local hf = _G.QuestLadderHintFrame
+        local hit1, hit2 = hf and hf.hits and hf.hits[1], hf and hf.hits and hf.hits[2]
+        check("ui: a hint with a place is clickable, a plain one isn't", hit1 and hit1:IsShown() and hit2 and not hit2:IsShown())
+        check("ui: ...and says so", (hf.lines[1]:GetText() or ""):find("(click for a map pin)", 1, true) ~= nil
+            and not (hf.lines[2]:GetText() or ""):find("map pin", 1, true), hf.lines[1]:GetText())
+        M.waypoint = nil
+        local click = hit1 and hit1.__scripts and hit1.__scripts.OnClick
+        if click then click(hit1, "LeftButton") end
+        check("ui: clicking the line places the pin", M.waypoint and M.waypoint.x == 0.463 and M.waypoint.y == 0.739,
+            M.waypoint and M.waypoint.x)
         _G.SlashCmdList.QUESTLADDER("help")
         _G.SlashCmdList.QUESTLADDER("reserve 4")
         check("slash reserve", ns.db.reserveSlots == 4)
@@ -1133,6 +1211,42 @@ do
         check("diag: keeps the last 10 runs", #_G.QuestLadderDiag.runs == 10, #_G.QuestLadderDiag.runs)
         _G.SlashCmdList.QUESTLADDER("diag clear")
         check("diag: clear empties the history", #_G.QuestLadderDiag.runs == 0)
+
+        -- 0.3.24: right after /reload a diag saved the log-only plan (0 new quests); now it waits
+        -- until the route settles, up to 30 s
+        local timers = {}
+        _G.C_Timer = { After = function(_, fn) timers[#timers + 1] = fn end }
+        local function tick() local list = timers; timers = {}; for _, fn in ipairs(list) do fn() end end
+        local realBusy = ns.Diag.Busy
+        local busy = { "the route is still being planned", "the route is still being planned" }
+        ns.Diag.Busy = function() return table.remove(busy, 1) end
+        _G.SlashCmdList.QUESTLADDER("diag waits")
+        check("diag waits: nothing saved while the route is being planned", #_G.QuestLadderDiag.runs == 0)
+        tick()
+        check("diag waits: still waiting", #_G.QuestLadderDiag.runs == 0)
+        tick()
+        local w = _G.QuestLadderDiag.runs[1]
+        check("diag waits: saved once the route settles", w and w.label == "waits" and w.waited == 1 and w.gaveUpWaiting == nil,
+            w and tostring(w.waited))
+        ns.Diag.Busy = function() return "the route is still being planned" end
+        _G.SlashCmdList.QUESTLADDER("diag")
+        for _ = 1, 100 do tick() end
+        w = _G.QuestLadderDiag.runs[2]
+        check("diag waits: gives up after 30 s and says why", w and w.waited >= 30 and w.gaveUpWaiting == "the route is still being planned",
+            w and tostring(w.waited))
+        _G.SlashCmdList.QUESTLADDER("diag now")
+        check("diag now: doesn't wait", #_G.QuestLadderDiag.runs == 3)
+        ns.Diag.Busy = realBusy
+        for _, f in ipairs(M.frames) do
+            local s = f.__scripts and f.__scripts.OnUpdate
+            if s then for _ = 1, 500 do s(f, 0.016) end end
+        end
+        check("diag busy: settled once the route is planned", realBusy() == nil, tostring(realBusy()))
+        ns.Debounce("replan", 1, function() end)
+        check("diag busy: while a replan is due", realBusy() == "a replan is about to start", tostring(realBusy()))
+        tick()
+        check("diag busy: settled again after it", realBusy() == nil, tostring(realBusy()))
+        _G.C_Timer = nil
     end
     _G.LibStub, _G.MainMenuBarBackpackButton = nil, nil
 end
@@ -1313,7 +1427,8 @@ do
     check("use item: planned", plan ~= nil and plan.byId.T60 ~= nil and plan.byId["O61:1"] ~= nil)
     plan = plan or { byId = {} }
     local step = { tasks = { plan.byId.T60, plan.byId["O61:1"], plan.byId.T62, plan.byId.T63 } }
-    -- no OnQuestAccepted here: this is what you see after a /reload
+    -- no OnQuestAccepted here: this is what you see after a /reload. Nothing selected, no
+    -- position: the hint says what to select, and the button waits (0.3.25).
     local hints = H.Compute({ byId = ns.Ladder.snapshot, bags = ns.QuestState.Bags(), step = step, now = M.time })
     local function find(...)
         local needles = { ... }
@@ -1324,15 +1439,178 @@ do
         end
         return nil
     end
-    local symbol = find("Use ", "Symbol of Life", "Fallen Guard", "A Lesson in Healing")
-    check("use item: required item of a no-objective quest, used on its NPC", symbol and symbol.kind == "use", symbol and symbol.text)
-    check("use item: quest item QuestieDB links to the quest, used on the objective's NPC",
-        find("Use ", "Holy Water", "Scarlet Zealot", "Bless the Fallen") ~= nil)
+    local pending = find("Select ", "Fallen Guard", "Symbol of Life", "A Lesson in Healing")
+    check("use item: a no-objective quest's item: select its NPC first", pending and pending.kind == "info", pending and pending.text)
+    check("use item: an item QuestieDB links to the quest: select the objective's NPC first",
+        find("Select ", "Scarlet Zealot", "Holy Water", "Bless the Fallen") ~= nil)
     check("use item: an item without a Use: effect is just carried", find("Strange Note") == nil)
     check("use item: nothing to use once a quest's own objectives are done", find("Done Already") == nil)
     H.list = hints
+    check("use item: the button stays empty until then", H.UsableItem() == nil, H.UsableItem() and H.UsableItem().itemId)
+    -- target Fallen Guard: the Symbol of Life pops up
+    M.guids = { target = "Creature-0-1-2-3-601-0000AAAA" }
+    M.names = { target = "Fallen Guard" }
+    hints = H.Compute({ byId = ns.Ladder.snapshot, bags = ns.QuestState.Bags(), step = step, now = M.time })
+    local symbol = find("Use ", "Symbol of Life", "Fallen Guard", "A Lesson in Healing")
+    check("use item: target its NPC and it's ready", symbol and symbol.kind == "use" and symbol.button, symbol and symbol.text)
+    H.list = hints
     local use = H.UsableItem()
-    check("use item: goes on the use button", use and (use.itemId == 700 or use.itemId == 701), use and use.itemId)
+    check("use item: then it goes on the use button", use and use.itemId == 700, use and use.itemId)
+    -- the Dried Seeds case: a quest item for a quest that isn't this step's never shows from afar
+    local blessStep = { tasks = { plan.byId["O61:1"] } }
+    local function later(point)
+        return H.Compute({ point = point, byId = ns.Ladder.snapshot, bags = ns.QuestState.Bags(), plan = plan,
+                           step = blessStep, now = M.time })
+    end
+    M.guids, M.names = {}, {}
+    hints = later(ns.Geo.Point(1429, 0.90, 0.90))
+    check("use item: a later step's item doesn't show from afar", find("Symbol of Life") == nil)
+    H.list = hints
+    check("use item: ...and stays off the button", H.UsableItem() == nil, H.UsableItem() and H.UsableItem().itemId)
+    -- 0.3.26: out of order. Target Fallen Guard and the later step's item shows anyway.
+    M.guids = { target = "Creature-0-1-2-3-601-0000AAAA" }
+    M.names = { target = "Fallen Guard" }
+    hints = later(ns.Geo.Point(1429, 0.90, 0.90))
+    local early = find("Use ", "Symbol of Life", "Fallen Guard", "A Lesson in Healing", "but you're here")
+    check("use item: a later step's item shows once its target is selected", early and early.button and early.kind == "use",
+        early and early.text)
+    local T60step
+    for i, s in ipairs(plan.steps) do for _, t in ipairs(s.tasks) do if t == plan.byId.T60 then T60step = i end end end
+    check("use item: ...and says which step it is", early and T60step
+        and early.text:find("(step " .. T60step .. ",", 1, true) ~= nil, early and early.text)
+    H.list = hints
+    check("use item: ...and goes on the button", H.UsableItem() and H.UsableItem().itemId == 700,
+        H.UsableItem() and H.UsableItem().itemId)
+    hints = H.Compute({ byId = ns.Ladder.snapshot, bags = ns.QuestState.Bags(), step = blessStep, now = M.time })
+    check("use item: without a plan, only this step counts", find("Symbol of Life") == nil)
+    -- standing at the later step's target counts too, and this step's unready item doesn't block it
+    M.guids, M.names = {}, {}
+    hints = later(ns.Geo.Point(1429, 0.43, 0.41))
+    early = find("Use ", "Symbol of Life", "but you're here")
+    check("use item: standing at a later step's target: ready", early and early.button, early and early.text)
+    check("use item: this step's item still says what to select", find("Select ", "Scarlet Zealot", "Holy Water") ~= nil)
+    H.list = hints
+    check("use item: the later step's item takes the empty button", H.UsableItem() and H.UsableItem().itemId == 700,
+        H.UsableItem() and H.UsableItem().itemId)
+    -- both ready the same way (standing at both): this step's item wins the button
+    M.guids, M.names = {}, {}
+    hints = later(ns.Geo.Point(1429, 0.44, 0.415))
+    H.list = hints
+    check("use item: both ready: this step's item gets the button", H.UsableItem() and H.UsableItem().itemId == 701,
+        H.UsableItem() and H.UsableItem().itemId)
+    check("use item: ...the later one is listed below it", find("Symbol of Life", "but you're here") ~= nil)
+    local stand = find("Use ", "Holy Water")
+    check("use item: standing near it: no 'This one', no button nag", stand and not stand.text:find("This one", 1, true)
+        and not stand.text:find("use button", 1, true) and stand.priority == 92, stand and stand.text)
+    -- 0.3.28: what you've selected beats what you're only standing near, so the button holds
+    -- the item the line tells you to use
+    M.guids = { target = "Creature-0-1-2-3-601-0000AAAA" }
+    M.names = { target = "Fallen Guard" }
+    hints = later(ns.Geo.Point(1429, 0.45, 0.42))
+    H.list = hints
+    check("use item: the selected target's item gets the button", H.UsableItem() and H.UsableItem().itemId == 700,
+        H.UsableItem() and H.UsableItem().itemId)
+    local sel = find("Use ", "Symbol of Life", "Fallen Guard")
+    check("use item: ...and its line says how to use it", sel and sel.text:find(" - click the use button", 1, true) ~= nil,
+        sel and sel.text)
+    -- UseTasks: this step's quests aren't repeated as later ones; done tasks are left out
+    local now, laterQ, at = H.UseTasks(plan, blessStep)
+    check("use item: UseTasks splits this step from later ones", now[61] and not laterQ[61] and laterQ[60] and at[60] == T60step,
+        tostring(at[60]))
+    check("use item: UseTasks with no plan or step", next((H.UseTasks(nil, nil))) == nil)
+    -- the diag lists both, with where they are
+    M.guids, M.names = {}, {}
+    if not ns.Diag then assert(loadfile(ADDON_DIR .. "/Diag.lua"))("QuestLadder", ns) end
+    local qi
+    for _, c in ipairs(ns.Diag.checks) do if c.id == "questitems" then qi = c end end
+    local okD, _, _, dData = pcall(qi.fn, { step = blessStep, byId = ns.Ladder.snapshot, bags = ns.QuestState.Bags(),
+        list = M.log, player = { point = ns.Geo.Point(1429, 0.43, 0.41) } })
+    local lines = okD and dData and table.concat(dData.stepUse or {}, " / ") or ""
+    check("use item: diag shows this step's and a later step's item",
+        lines:find("this step 61 ", 1, true) and lines:find("step " .. tostring(T60step) .. " 60 ", 1, true)
+        and lines:find("standing at it", 1, true), lines)
+    M.guids, M.names = {}, {}
+
+    -- 0.3.28: facing the Bubbling Fissure showed ">> This one: Use Bubbling Fissure - press your
+    -- Interact key". You use the Dried Seeds on it; interacting does nothing.
+    local WM = ns.WorldMarks
+    M.items[5068] = { name = "Dried Seeds", classID = 12, spell = "Plant Seeds" }
+    local bagBefore = M.bag
+    M.bag = { { id = 700 }, { id = 701, questItem = true }, { id = 602 }, { id = 5068 } }
+    local oasisQ = { id = 877, title = "The Stagnant Oasis", complete = false, specialItem = { itemId = 5068 },
+                     objectives = { { text = "Test the Dried Seeds: 0/1", type = "object", finished = false } } }
+    local oasisStep = { tasks = { { id = "O877:1", kind = "objective", questId = 877, quest = { title = "The Stagnant Oasis" },
+                                    obj = { type = "object", targets = { object = { 3737 } } },
+                                    loc = ns.Geo.Point(1429, 0.30, 0.30) } } }
+    local function oasis()
+        return H.Compute({ byId = { [877] = oasisQ }, bags = ns.QuestState.Bags(), step = oasisStep, now = M.time })
+    end
+    WM.SetTargets(oasisStep)
+    M.guids = { softinteract = "GameObject-0-1-2-3-3737-00001111" }
+    M.names = { softinteract = "Bubbling Fissure" }
+    ns.DispatchEvent("PLAYER_SOFT_INTERACT_CHANGED", nil, M.guids.softinteract)
+    check("use on object: facing the fissure is a hit", WM.softHit and WM.softHit.label == "Use")
+    hints = oasis()
+    local cue = find(">> This one:", "Use ", "Dried Seeds", "on |cffffffffBubbling Fissure", "The Stagnant Oasis",
+        " - click the use button")
+    check("use on object: the cue says to use the seeds on it", cue and cue.kind == "use" and cue.button, cue and cue.text)
+    check("use on object: ...and it's the top line", cue and hints[1] == cue, hints[1] and hints[1].text)
+    check("use on object: no 'press your Interact key'", find("Interact key") == nil, find("Interact key") and find("Interact key").text)
+    H.list = hints
+    check("use on object: the seeds are on the button", H.UsableItem() and H.UsableItem().itemId == 5068,
+        H.UsableItem() and H.UsableItem().itemId)
+    -- with a key bound, the line names the key
+    _G.GetBindingKey = function(cmd) return cmd == "CLICK QuestLadderUseButton:LeftButton" and "F" or nil end
+    hints = oasis()
+    check("use on object: names your key when one is bound", find(">> This one:", "Dried Seeds", " - press F") ~= nil)
+    _G.GetBindingKey = nil
+    -- an object you interact with (no item to use on it) keeps the Interact cue
+    oasisQ.specialItem = nil
+    hints = oasis()
+    check("use on object: no item, the Interact cue stays", find(">> This one:", "Use Bubbling Fissure", "Interact key") ~= nil)
+    oasisQ.specialItem = { itemId = 5068 }
+    -- turning away: no cue, and the seeds wait again
+    M.guids, M.names = {}, {}
+    ns.DispatchEvent("PLAYER_SOFT_INTERACT_CHANGED", "GameObject-0-1-2-3-3737-00001111", nil)
+    hints = oasis()
+    H.list = hints
+    check("use on object: turned away, the seeds wait again", find("This one") == nil and H.UsableItem() == nil,
+        H.UsableItem() and H.UsableItem().itemId)
+    -- the target cue too: "Target is right: Use item on Fallen Guard" gives way to the use line
+    WM.SetTargets(step)
+    M.guids = { target = "Creature-0-1-2-3-601-0000AAAA" }
+    M.names = { target = "Fallen Guard" }
+    ns.DispatchEvent("PLAYER_TARGET_CHANGED")
+    check("use on target: targeting Falgan's stand-in is a hit", WM.targetHit ~= nil)
+    hints = H.Compute({ byId = ns.Ladder.snapshot, bags = ns.QuestState.Bags(), step = step, now = M.time })
+    check("use on target: one line, the use line", find("Target is right") == nil
+        and find("Use ", "Symbol of Life", "Fallen Guard", " - click the use button") ~= nil)
+    WM.SetTargets(nil)
+    M.guids, M.names, M.bag = {}, {}, bagBefore
+    -- standing at the Scarlet Zealots' spawn is enough (some targets can't be selected)
+    M.guids, M.names = {}, {}
+    hints = H.Compute({ point = ns.Geo.Point(1429, 0.45, 0.42), byId = ns.Ladder.snapshot, bags = ns.QuestState.Bags(),
+                        step = step, now = M.time })
+    local holy = find("Use ", "Holy Water", "Scarlet Zealot", "Bless the Fallen")
+    check("use item: standing at its target's spawn: ready", holy and holy.button, holy and holy.text)
+    check("use item: the other quest's NPC 60 yd away still needs selecting", find("Select ", "Fallen Guard") ~= nil)
+    H.list = hints
+    -- facing an object (soft target) counts as selecting it; something else doesn't
+    local seeds = { npc = {}, object = { [3737] = true }, names = { "Test the Dried Seeds" } }
+    M.guids = { softinteract = "GameObject-0-1-2-3-3737-00001111" }
+    check("use item: facing the object selects it", H.UseReady(seeds, {}, nil) == true)
+    M.guids = { softinteract = "GameObject-0-1-2-3-9999-00001111" }
+    check("use item: facing another object doesn't", H.UseReady(seeds, {}, nil) == false)
+    M.guids = { softinteract = "SECRET-GUID" }
+    local origSecret = _G.issecretvalue
+    _G.issecretvalue = function(v) return v == "SECRET-GUID" end
+    check("use item: a secret GUID is never read", H.UseReady(seeds, {}, nil) == false)
+    _G.issecretvalue = origSecret
+    M.guids = {}
+    -- nothing known to aim at: within 60 yd of the step's place
+    local spot = { { kind = "objective", loc = ns.Geo.Point(1429, 0.50, 0.50) } }
+    check("use item: no target known: ready at the place", H.UseReady(nil, spot, ns.Geo.Point(1429, 0.51, 0.50)) == true)
+    check("use item: no target known: not from afar", H.UseReady(nil, spot, ns.Geo.Point(1429, 0.60, 0.50)) == false)
     check("use item: the turn-in line says to use it first",
         ns.Ladder.TaskText(plan.byId.T60):find("Use |cff66ccff[Symbol of Life]|r on Fallen Guard, then turn in", 1, true) ~= nil,
         ns.Ladder.TaskText(plan.byId.T60))
@@ -1935,6 +2213,1158 @@ do
         (by[2901] and by[2901].reason) or (by[5956] and by[5956].reason) or (by[6256] and by[6256].reason))
     check("tools: enchanting rod kept even when bags are short", not by[6218], by[6218] and by[6218].reason)
     check("tools: a gray broken one is still junk", by[3001] and by[3001].action == "sell")
+end
+
+---------------------------------------------------------------------------
+-- 15e. 0.3.19: "tired of lower level quests that don't pump out good rewards". New quests are
+-- valued by QuestieDB's quest XP at your level; the tiny ones are skipped, and when few good
+-- ones are left nearby the guide names the next area.
+---------------------------------------------------------------------------
+do
+    local ns = setup()
+    local D, L = ns.Data, ns.Ladder
+    M.player.level = 15
+    local function q(name, level, extra)
+        local t = { name = name, startedBy = { { 400 } }, finishedBy = { { 400 } }, requiredLevel = 1, questLevel = level,
+                    objectives = { { { 420 } } } }
+        for k, v in pairs(extra or {}) do t[k] = v end
+        return t
+    end
+    local quests = {
+        [501] = q("Solid Quest", 15),
+        [502] = q("Low Quest", 10),
+        [503] = q("Tiny Talk", 15, { objectives = {} }),
+        [504] = q("Breadcrumb", 14, { objectives = {} }),
+        [505] = q("Real Quest", 15, { preQuestSingle = { 504 } }),
+        [506] = q("Class Quest", 15, { requiredClasses = 1, objectives = {} }),
+        [507] = q("Unknown XP", 15),
+        [508] = q("Shiny Reward", 15, { objectives = {} }),
+        [509] = q("Older But Fine", 11),
+    }
+    local xp = {
+        [501] = { 15, 1050 }, [502] = { 10, 300 }, [503] = { 15, 100 }, [504] = { 14, 150 }, [505] = { 15, 1200 },
+        [506] = { 15, 150 }, [508] = { 15, 150 }, [509] = { 11, 700 },
+    }
+    -- the rest of the level-15 quests (real data has hundreds per level band): a solid one is 1000
+    for id = 9001, 9030 do xp[id] = { 15, 1000 } end
+    -- a hub 1700 yd away with rich quests
+    for id = 511, 516 do
+        quests[id] = { name = "Far Quest " .. id, startedBy = { { 410 } }, finishedBy = { { 410 } }, requiredLevel = 1,
+                       questLevel = 15, objectives = { { { 421 } } } }
+        xp[id] = { 15, 2500 }
+    end
+    D.InitWith(M.fakeDB({
+        quests = quests, questXP = xp,
+        npcs = {
+            [400] = { name = "Near Giver", spawns = spawn(43, 42) },
+            [410] = { name = "Far Giver", spawns = spawn(90, 90) },
+            [420] = { name = "Near Mob", minLevel = 14, spawns = spawn(45, 45) },
+            [421] = { name = "Far Mob", minLevel = 14, spawns = spawn(91, 91) },
+        },
+        objects = {},
+        items = { [950] = { name = "Shiny Helm", class = 4, requiredLevel = 10, questRewards = { 508 } } },
+    }))
+    M.items[950] = { name = "Shiny Helm", classID = 4, subClassID = 1, equipLoc = "INVTYPE_HEAD", sell = 40,
+                     stats = { RESISTANCE0_NAME = 20, ITEM_MOD_STRENGTH_SHORT = 3 } }
+
+    check("value: full XP up to 5 levels above the quest", D.XPAtLevel(1000, 10, 15) == 1000)
+    check("value: then 20% less per level", D.XPAtLevel(1000, 10, 16) == 800 and D.XPAtLevel(1000, 10, 18) == 400)
+    check("value: never under 10%", D.XPAtLevel(1000, 10, 30) == 100)
+    check("value: a solid quest at 15 is the 75th percentile nearby", D.SolidQuestXP(15) == 1000, D.SolidQuestXP(15))
+
+    local built = false
+    D.BuildIndexes(ns.QuestState.Player(), function() built = true end)
+    local player = ns.QuestState.Player()
+    local function verdict(id)
+        local ok, _, why = L.WorthDoing(id, player)
+        return ok, why
+    end
+    check("value: a solid quest is planned", (verdict(501)))
+    check("value: a low-level quest worth 30% is skipped", not verdict(502))
+    check("value: a tiny talk quest is skipped", not verdict(503))
+    check("value: an older quest still worth 70% stays", (verdict(509)))
+    local ok, why = verdict(504)
+    check("value: a breadcrumb into a solid quest stays", ok and why == "leads on", why)
+    ok, why = verdict(506)
+    check("value: a quest for your class stays", ok and why == "class", why)
+    ok, why = verdict(507)
+    check("value: unknown XP stays", ok and why == "unknown", why)
+    ok, why = verdict(508)
+    check("value: a reward you'd wear keeps a tiny quest", built and ok and why == "upgrade", why)
+
+    ns.Ladder.Rebuild("value test")
+    local plan = L.plan
+    local cands = {}
+    for _, c in ipairs((plan and plan.candidates) or {}) do cands[c.id] = true end
+    check("plan: the skipped ones aren't in it", cands[501] and cands[509] and not cands[502] and not cands[503],
+        table.concat((function() local o = {} for id in pairs(cands) do o[#o + 1] = id end table.sort(o) return o end)(), ","))
+    check("plan: the breadcrumb's follow-up comes with it", cands[504] and cands[505])
+    local skipped = {}
+    for _, s in ipairs((plan and plan.skippedLowValue) or {}) do skipped[s.id] = s end
+    check("plan: the skipped ones are listed with their XP", skipped[502] and skipped[502].xp == 300 and skipped[503] ~= nil)
+    check("plan: plenty of good quests nearby: no next area", plan and plan.nextArea == nil)
+    local pickText
+    for _, t in ipairs((plan and plan.order) or {}) do if t.id == "P501" then pickText = L.TaskText(t) end end
+    check("step text shows the XP", pickText and pickText:find("+1050 XP", 1, true), pickText)
+
+    -- Ask for more (200% of a solid quest): little is left nearby, and the rich hub is named
+    ns.db.minQuestValue = 2
+    ns.Ladder.Rebuild("value test 2")
+    plan = L.plan
+    local area = plan and plan.nextArea
+    check("next area: found when little is left nearby", area and area.count == 6 and area.giver == "Far Giver",
+        area and (area.count .. " " .. tostring(area.giver)))
+    local hints = ns.Hints.Compute({ plan = plan, byId = {}, bags = ns.QuestState.Bags(), now = M.time })
+    local hinted = false
+    for _, h in ipairs(hints) do if h.text:find("Next area:", 1, true) and h.text:find("6 quests worth doing", 1, true) then hinted = true end end
+    check("next area: shown in the hint box", hinted)
+    ns.db.minQuestValue = 0
+    check("value: 0 keeps every quest", (verdict(502)) and (verdict(503)))
+    _G.SlashCmdList.QUESTLADDER("minxp 30")
+    check("value: /ladder minxp 30 sets 30%", math.abs(ns.db.minQuestValue - 0.3) < 1e-9, ns.db.minQuestValue)
+    ns.db.minQuestValue = 0.5
+end
+
+---------------------------------------------------------------------------
+-- 15f. 0.3.20: Forever extras for a casual player (from Wowhead's Forever guides; the facts
+-- the add-on uses come from QuestieDB and the game)
+---------------------------------------------------------------------------
+do
+    local ns = setup()
+    local D, L, G = ns.Data, ns.Ladder, ns.Goodies
+    M.player.level, M.player.money = 15, 200000
+    local function q(name, level, extra)
+        local t = { name = name, startedBy = { { 400 } }, finishedBy = { { 400 } }, requiredLevel = 1, questLevel = level,
+                    objectives = {} }
+        for k, v in pairs(extra or {}) do t[k] = v end
+        return t
+    end
+    local xp = {}
+    for id = 9001, 9030 do xp[id] = { 15, 1000 } end
+    local quests = {
+        [601] = q("Camping 101: Skinning", 5), [602] = q("The Great Outdoors", 5),
+        [603] = q("The Dalaran Digest", 10, { zoneOrSort = -284, startedBy = { nil, nil, { 7001 } }, finishedBy = { { 401 } } }),
+        [604] = q("Plain Errand", 15),
+        [605] = q("Bag Quest", 15),
+        [606] = q("Lucky Drop", 15, { startedBy = { nil, nil, { 7002 } } }), -- starts from a mob drop: never planned
+        [79007] = q("...and that note you found", 14, { startedBy = { nil, { 9100 } }, requiredLevel = 14 }),
+        [79192] = q("Stepping Stones", 24, { preQuestSingle = { 79007 }, requiredLevel = 14 }),
+        [79976] = q("This Must Be The Place", 32, { requiredLevel = 14 }),
+        [91899] = q("A Sealed Crate", 60, { finishedBy = { { 256386, 256390 } } }),
+        [610] = q("Into the Keep", 16, { zoneOrSort = 209, objectives = { { { 430 } } } }),
+        [611] = q("Out in the Woods", 16, { objectives = { { { 431 } } } }),
+    }
+    for id, t in pairs(quests) do xp[id] = xp[id] or { t.questLevel, 100 } end -- all tiny
+    D.InitWith(M.fakeDB({
+        quests = quests, questXP = xp,
+        npcs = {
+            [400] = { name = "Near Giver", spawns = spawn(43, 42) },
+            [401] = { name = "Owen Thadd", spawns = spawn(44, 42) },
+            [402] = { name = "Bag Vendor", spawns = spawn(45, 41), npcFlags = 128 },
+            [403] = { name = "Randal Hunter", subName = "Horse Riding Trainer", friendlyToFaction = "A", spawns = spawn(80, 80), npcFlags = 16 },
+            [404] = { name = "Ram Guy", subName = "Ram Riding Trainer", friendlyToFaction = "A", spawns = spawn(43, 43), npcFlags = 16 },
+            [405] = { name = "World Horse Riding Trainer", subName = "Horse Riding Trainer", spawns = spawn(42, 41), npcFlags = 16 },
+            [256386] = { name = "Dokimi", subName = "Inventory Intake", friendlyToFaction = "H", spawns = spawn(50, 50) },
+            [256390] = { name = "Marcy Baker", subName = "Inventory Intake", friendlyToFaction = "A", spawns = spawn(60, 60) },
+            [430] = { name = "Keep Guard", spawns = { [209] = { { -1, -1 } } } },
+            [431] = { name = "Wolf", spawns = spawn(50, 45) },
+            [432] = { name = "Lucky Mob", spawns = spawn(46, 46) },
+        },
+        objects = {
+            [9100] = { name = "Burned Plank", spawns = spawn(70, 30) },
+            [9101] = { name = "Dalaran Digest", spawns = spawn(41, 40) },
+        },
+        items = {
+            [7001] = { name = "The Dalaran Digest, Vol. 23", objectDrops = { 9101 } },
+            [7002] = { name = "Strange Letter", npcDrops = { 432 } },
+            [8001] = { name = "Old Moneybag", class = 1, questRewards = { 605 } },
+            [8002] = { name = "Heavy Brown Bag", class = 1, vendors = { 402 } },
+        },
+    }))
+    M.items[8001] = { name = "Old Moneybag", classID = 1, subClassID = 0, sell = 5 }
+    M.items[8002] = { name = "Heavy Brown Bag", classID = 1, subClassID = 0, sell = 2500 }
+    M.items[8003] = { name = "Shiny Pebble", classID = 15, sell = 900 }
+    local slots = { [8001] = 8, [8002] = 10 }
+    _G.C_TooltipInfo = { GetItemByID = function(id)
+        return { lines = { { leftText = (M.items[id] or {}).name or "?" }, slots[id] and { leftText = slots[id] .. " Slot Bag" } or nil } }
+    end }
+    local worn = { 6, 6, 10, 10 } -- your four bags
+    _G.C_Container.GetContainerNumSlots = function(bag) if bag == 0 then return 16 end return worn[bag] or 0 end
+    _G.C_Map.GetAreaInfo = function(id) return ({ [209] = "Shadowfang Keep" })[id] end
+    D.BuildIndexes(ns.QuestState.Player(), function() end)
+    local player = ns.QuestState.Player()
+
+    -- must-do quests stay whatever their XP
+    check("must-do: camping unlocks", G.MustDo(601) == "unlocks a camp item" and G.MustDo(602) == "unlocks camping")
+    check("must-do: Library books", G.MustDo(603) == "Library book")
+    check("must-do: the sleeping bag chain", G.MustDo(79192) == "Cozy Sleeping Bag chain")
+    check("must-do: supply crates", G.MustDo(91899) == "supply crate")
+    check("must-do: a plain tiny quest is not", G.MustDo(604) == nil)
+    local ok, _, why = L.WorthDoing(601, player)
+    check("must-do: kept by the low-XP filter", ok and why == "goodie", why)
+    check("must-do: the tiny errand is still skipped", not (L.WorthDoing(604, player)))
+
+    -- quests that start from an item you find
+    local pts = D.GiverPoints(D.Quest(603).startedBy)
+    check("found item: the book's spot is its pickup", #pts == 1 and pts[1].foundItem == 7001 and pts[1].giverId == -9101,
+        #pts .. " " .. tostring(pts[1] and pts[1].giverId))
+    check("found item: never a mob drop", #D.GiverPoints(D.Quest(606).startedBy) == 0)
+    local text = L.TaskText({ kind = "pickup", questId = 603, quest = { title = "The Dalaran Digest", pickupName = "The Dalaran Digest, Vol. 23",
+                                                                         pickup = pts[1] } })
+    check("found item: the step says to pick it up and right-click it", text:find("right-click it", 1, true)
+        and text:find("Library book", 1, true), text)
+
+    -- bags
+    check("bags: slots read from the tooltip", G.BagSlots(8001) == 8 and G.BagSlots(8002) == 10)
+    check("bags: your smallest bag", G.SmallestBag() == 6)
+    check("bags: an 8-slot reward is an upgrade, a 6 isn't", G.IsBagUpgrade(8) and not G.IsBagUpgrade(6))
+    check("bags: a bag reward is a must-do", G.MustDo(605) == "rewards a 8-slot bag", G.MustDo(605))
+    local pick = ns.Gear.BestChoice({ { index = 1, itemId = 8003 }, { index = 2, itemId = 8001 } }, player)
+    check("bags: a bigger bag beats sell value in a reward choice", pick and pick.itemId == 8001 and pick.reason:find("8 slots"),
+        pick and pick.reason)
+    local buy = G.BagToBuy(player)
+    check("bags: a 10-slot bag to buy, from the vendor nearby", buy and buy.itemId == 8002 and buy.vendor == "Bag Vendor"
+        and buy.price == 10000, buy and (buy.name .. " " .. buy.price))
+    M.player.money = 5000
+    check("bags: not when it would eat your training gold", G.BagToBuy(ns.QuestState.Player()) == nil)
+    M.player.money = 200000
+    worn = { 10, 12, 10, 10 }
+    check("bags: nothing to buy once your bags are 10+", G.BagToBuy(player) == nil)
+    worn = { 6, 6, 10, 10 }
+
+    -- riding at 40
+    local function at(level, class, skills)
+        return { level = level, classFile = class or "WARRIOR", skills = skills or {}, money = 200000, raceFile = "Human",
+                 faction = "Alliance", point = player.point }
+    end
+    local base = 36 * 36 * 35
+    check("riding: 100g kept aside from level 35", ns.Gear.Reserve(36, at(36)) == base + ns.Gear.RIDING_COST)
+    check("riding: not before 35", ns.Gear.Reserve(30, at(30)) == 30 * 30 * 35)
+    check("riding: not for Paladins (class mount quest)", ns.Gear.Reserve(36, at(36, "PALADIN")) == base)
+    check("riding: not once you can ride", ns.Gear.Reserve(36, at(36, nil, { [762] = 75 })) == base)
+    check("riding: a heads-up at 38", (G.RidingHint(at(38)) or ""):find("Riding at 40", 1, true))
+    local t = G.RidingTrainer(at(40))
+    check("riding: your race's trainer, not a nearer one or a placeholder", t and t.name == "Randal Hunter", t and t.name)
+    local hint = G.RidingHint(setmetatable({ money = 1500000 }, { __index = at(40) }))
+    check("riding: at 40 with the gold: where to learn it", hint and hint:find("Learn Apprentice Riding", 1, true)
+        and hint:find("Randal Hunter", 1, true), hint)
+    check("riding: Paladins get the class mount quest line", (G.RidingHint(at(40, "PALADIN")) or ""):find("class mount quest", 1, true))
+
+    -- the Cozy Sleeping Bag chain
+    local _, byId = ns.QuestState.Snapshot()
+    local state = L.AvailabilityState(player, byId)
+    local cozy = G.CozyStart(player, byId, state)
+    check("cozy: suggested at 14+", cozy and cozy.questId == 79007 and cozy.giver == "Burned Plank", cozy and cozy.giver)
+    check("cozy: not before 14", G.CozyStart(at(13), byId, state) == nil)
+    M.completed[79976] = true
+    check("cozy: not once you have it", G.CozyStart(player, byId, state) == nil)
+    M.completed[79976] = nil
+    -- 0.3.29: "I don't know where or what level requirements the cozy sleeping bag quest has, but
+    -- I should be able to click on the step to place a pin": the hint says both, and has a pin
+    local function hintWith(plan, needle)
+        L.plan = plan
+        for _, h in ipairs(ns.Hints.Compute({ plan = plan, byId = {}, bags = ns.QuestState.Bags(), now = M.time })) do
+            if h.text:find(needle, 1, true) then return h end
+        end
+    end
+    local cozyHint = hintWith({ player = player, cozyStart = cozy }, "Cozy Sleeping Bag:")
+    check("cozy: the hint gives the chain's levels",
+        cozyHint and cozyHint.text:find("(quests level 14-32, you can start from level 14)", 1, true), cozyHint and cozyHint.text)
+    check("cozy: ...and where it starts", cozyHint and cozyHint.text:find("starts at Burned Plank in", 1, true)
+        and cozyHint.text:find("70.0, 30.0", 1, true), cozyHint and cozyHint.text)
+    check("cozy: ...with a map pin on it", cozyHint and cozyHint.pin and cozyHint.pin.mapId == cozy.point.mapId
+        and cozyHint.pin.x == cozy.point.x and cozyHint.pin.y == cozy.point.y and cozyHint.pin.title == "Burned Plank")
+    -- the route's pin, then the clicked one, then the route's again at the next step
+    L.plan = { player = player, steps = { { loc = ns.Geo.Point(1429, 0.2, 0.2), tasks = {} },
+                                          { loc = ns.Geo.Point(1429, 0.8, 0.8), tasks = {} } } }
+    L.current = 1
+    L.UpdateWaypoint()
+    check("pin: the route's pin is on the step", M.waypoint and M.waypoint.x == 0.2, M.waypoint and M.waypoint.x)
+    local prints = {}
+    local origPrint = ns.Print
+    ns.Print = function(msg) prints[#prints + 1] = msg end
+    check("pin: clicking the hint places its pin", L.PinHint(cozyHint) and M.waypoint and M.waypoint.x == cozy.point.x
+        and M.waypoint.y == cozy.point.y, M.waypoint and M.waypoint.x)
+    check("pin: ...and says where in chat", prints[1] and prints[1]:find("Burned Plank", 1, true)
+        and prints[1]:find("70.0, 30.0", 1, true), prints[1])
+    ns.Print = origPrint
+    L.UpdateWaypoint()
+    check("pin: the route doesn't take it back on the same step", M.waypoint and M.waypoint.x == cozy.point.x)
+    L.current = 2
+    L.UpdateWaypoint()
+    check("pin: the route's pin comes back at the next step", M.waypoint and M.waypoint.x == 0.8, M.waypoint and M.waypoint.x)
+    check("pin: a hint without a place does nothing", L.PinHint({ text = "x" }) == false)
+    -- with TomTom: its own arrow, and a second click replaces only the clicked one
+    local added, removed = {}, {}
+    _G.TomTom = { AddWaypoint = function(_, m, x, y, o) added[#added + 1] = { m, x, y, o.title }; return #added end,
+                  RemoveWaypoint = function(_, uid) removed[#removed + 1] = uid end }
+    L.PinTo(cozyHint.pin, "first")
+    L.PinTo(cozyHint.pin, "second")
+    check("pin: TomTom gets the arrow", #added == 2 and added[2][4] == "Quest Ladder: second" and added[2][2] == cozy.point.x)
+    check("pin: a second click replaces the first pin only", #removed == 1 and removed[1] == 1, table.concat(removed, ","))
+    _G.TomTom = nil
+    -- the other hints that name a place get one too
+    local buyHint = hintWith({ player = player, bagToBuy = buy }, "More bag space:")
+    check("pin: the bag vendor", buyHint and buyHint.pin and buyHint.pin.title == "Bag Vendor" and buy.point
+        and buyHint.pin.x == buy.point.x, buyHint and buyHint.pin and buyHint.pin.title)
+    local _, trainer = G.RidingHint(setmetatable({ money = 1500000 }, { __index = at(40) }))
+    check("pin: the riding hint names its trainer for the pin", trainer and trainer.name == "Randal Hunter" and trainer.point ~= nil)
+
+    -- supply crates
+    M.items[8010] = { name = "Waylaid Supplies: Copper Bars", classID = 7 }
+    M.items[8011] = { name = "Supply Shipment", classID = 7 }
+    M.bag = { { id = 8010 }, { id = 8011 } }
+    local crates = G.CratesInBags(ns.QuestState.Bags())
+    check("crates: found in your bags", #crates == 2 and crates[1].material == "Copper Bars" and crates[2].kind == "turnin")
+    local npc = G.CrateNpc(player)
+    check("crates: your faction's intake NPC", npc and npc.name == "Marcy Baker", npc and npc.name)
+    L.plan = { player = player }
+    local hints = ns.Hints.Compute({ plan = L.plan, byId = {}, bags = ns.QuestState.Bags(), now = M.time })
+    local fill, turnin, pinned = false, false, 0
+    for _, h in ipairs(hints) do
+        if h.text:find("Copper Bars", 1, true) and h.text:find("Marcy Baker", 1, true) then fill = true end
+        if h.text:find("Supply Shipment:", 1, true) then turnin = true end
+        if (h.text:find("Copper Bars", 1, true) or h.text:find("Supply Shipment:", 1, true)) and h.pin
+            and h.pin.title == "Marcy Baker" then pinned = pinned + 1 end
+    end
+    check("crates: hints say what to fill and who takes it", fill and turnin)
+    check("crates: both lines pin the intake NPC", pinned == 2, pinned)
+    M.bag = {}
+
+    -- dungeon quests to pick up
+    local groups = G.DungeonQuests(player, state, { 610, 611, 604 })
+    check("dungeons: only quests with objectives inside, by dungeon", #groups == 1 and groups[1].dungeon == "Shadowfang Keep"
+        and #groups[1].quests == 1 and groups[1].quests[1].id == 610, #groups .. " " .. tostring(groups[1] and groups[1].dungeon))
+    check("dungeons: says who gives it", groups[1] and groups[1].quests[1].giver == "Near Giver")
+    _G.C_TooltipInfo, _G.C_Map.GetAreaInfo = nil, nil
+end
+
+---------------------------------------------------------------------------
+-- 15g. 0.3.21: The Barrens, "resources are spread out a ton". New quests must be worth the walk
+-- (Planner.PruneTrips); a Silverpine quest's murlocs were looked for in Darkshore; a retired
+-- "zzOLD" flight point was a step; "/ladder dungeons" hid the dungeon toggle.
+---------------------------------------------------------------------------
+do
+    local ns = setup()
+    local P, Geo = ns.Planner, ns.Geo
+    check("trips: grinding at 17 gives 6.5 XP a second (130 XP a kill, 20 s each)", math.abs(P.GrindRate(17) - 6.5) < 1e-9)
+
+    -- A hub with quests in every direction (yards on one continent, walking at 7 yd/s)
+    local function pt(x, y) return { cont = 0, wx = x, wy = y, mapId = 1, x = 0, y = 0 } end
+    local hub = pt(0, 0)
+    local function obj(x, y) return { { index = 1, type = "monster", need = 1, have = 0, finished = false, loc = pt(x, y) } } end
+    local function cand(id, title, objectives, xp, extra)
+        local c = { id = id, title = title, pickup = hub, turnin = hub, objectives = objectives or {}, tripXP = xp }
+        for k, v in pairs(extra or {}) do c[k] = v end
+        return c
+    end
+    local function ctx(tripCheck)
+        return {
+            start = hub, level = 17, tripCheck = tripCheck, logCount = 1, logMax = 40,
+            active = { { id = 10, title = "East Camp (in your log)", objectives = obj(1500, 0), turnin = hub } },
+            candidates = {
+                cand(20, "Far West", obj(-2000, 0), 700),
+                cand(21, "Same East Camp", obj(1520, 30), 800),
+                cand(22, "North One", obj(0, 1500), 600),
+                cand(23, "North Two", obj(50, 1500), 600),
+                cand(24, "Far South Class Quest", obj(0, -2500), 150, { keep = true }),
+                cand(25, "Next Door", obj(100, 0), 300),
+                cand(26, "Breadcrumb", {}, 200),
+                cand(27, "Follow-up Far Away", obj(-1800, -1800), 1000, { after = { 26 }, chainedFrom = 26 }),
+            },
+        }
+    end
+    local plan = P.Plan(ctx(true))
+    local pruned, inOrder = {}, {}
+    for _, p in ipairs(plan.pruned) do pruned[p.questId] = p end
+    for _, t in ipairs(plan.order) do if t.kind == "pickup" then inOrder[t.questId] = true end end
+    local function list(set) local o = {} for id in pairs(set) do o[#o + 1] = id end table.sort(o) return table.concat(o, ",") end
+    check("trips: a far quest that gives less than grinding that long is dropped", pruned[20] ~= nil and not inOrder[20], list(pruned))
+    check("trips: a quest at a camp you visit anyway stays", inOrder[21] and not pruned[21])
+    check("trips: next door stays", inOrder[25])
+    check("trips: two quests sharing one long walk are weighed together and dropped",
+        pruned[22] and pruned[23] and pruned[22].together == 2, pruned[22] and pruned[22].together)
+    check("trips: a quest marked keep stays however far", inOrder[24])
+    check("trips: a far follow-up goes, its breadcrumb at the hub stays", pruned[27] and inOrder[26] and not pruned[26], list(inOrder))
+    check("trips: the route left is valid", P.IsValid(plan.order, { logCount = 1, logMax = 40 }))
+    check("trips: dropped counts only quests left out for log space", plan.dropped == 0, plan.dropped)
+    check("trips: each skipped quest says what it would have cost", pruned[20] and pruned[20].seconds > 120
+        and pruned[20].title == "Far West" and pruned[20].worth < P.TRIP_KEEP_SHARE, pruned[20] and pruned[20].seconds)
+    local tie = ctx(true)
+    tie.candidates = { cand(20, "Far West", obj(-2000, 0), 3100) } -- ~83% of grinding for its ~570 s detour
+    check("trips: a near tie with grinding stays (real grinding has eating and drinking in it)", #P.Plan(tie).pruned == 0)
+    local off = P.Plan(ctx(nil))
+    check("trips: off keeps every quest", #off.pruned == 0 and #off.order == #plan.tasks, #off.order .. " of " .. #plan.tasks)
+    check("trips: and the check makes the route shorter", plan.cost < off.cost - 600,
+        string.format("%.0f vs %.0f s", plan.cost, off.cost))
+    local lines = ns.Ladder.SkippedLines(plan)
+    local text = table.concat(lines, "\n")
+    check("trips: /ladder skipped lists them with the travel they'd add", text:find("Not worth the walk from here (4):", 1, true)
+        and text:find("Far West - 700 XP, but adds", 1, true) and text:find("2 quests out there together: 1200 XP", 1, true), text)
+
+    -- Mobs on two continents: a Silverpine quest's murlocs, while you're in The Barrens
+    local darkshore = { pt(100, 500), pt(110, 505), pt(105, 495) }
+    for _, p in ipairs(darkshore) do p.cont = 1 end
+    local silverpine = { pt(500, 1600), pt(510, 1605), pt(505, 1595) }
+    local pts = {}
+    for _, p in ipairs(darkshore) do pts[#pts + 1] = p end
+    for _, p in ipairs(silverpine) do pts[#pts + 1] = p end
+    local you = { cont = 1, wx = 112, wy = -2777 }
+    local sepulcher = pt(522, 1652)
+    check("cluster: without the quest's home, the nearest camp (Darkshore) wins", Geo.BestCluster(pts, you, 90).cont == 1)
+    local c = Geo.BestCluster(pts, you, 90, sepulcher)
+    check("cluster: with it, the camp on the quest's continent near its NPC", c.cont == 0 and math.abs(c.wx - 505) < 1, c.cont)
+    local near = { pt(0, 0), pt(10, 5) }
+    local byNpc = { pt(2000, 0), pt(2010, 5) }
+    local both = { near[1], near[2], byNpc[1], byNpc[2] }
+    check("cluster: on the quest's continent, the camp near you still wins", Geo.BestCluster(both, pt(5, 0), 90, pt(2100, 0)).wx < 100)
+
+    -- the same in the full pipeline: you're on continent 1, the quest's NPC on continent 0
+    local D = ns.Data
+    D.InitWith(M.fakeDB({
+        quests = { [810] = { name = "Murloc Eyes", startedBy = { { 450 } }, finishedBy = { { 450 } }, requiredLevel = 1,
+                             questLevel = 12, objectives = { { { 460 } } } } },
+        npcs = {
+            [450] = { name = "Apothecary Renferrel", spawns = spawn(50, 50) },
+            [460] = { name = "Murloc", spawns = { [12] = { { 60, 60 }, { 61, 61 }, { 60.5, 60.5 } },
+                                                  [40] = { { 45, 45 }, { 46, 46 }, { 45.5, 45.5 } } } },
+        },
+        objects = {}, items = {},
+    }))
+    M.player.mapId, M.player.x, M.player.y, M.player.level = 1436, 0.44, 0.44, 12
+    M.log = { { id = 810, title = "Murloc Eyes", level = 12, complete = false,
+                objectives = { { text = "Murloc slain: 0/3", type = "monster", finished = false, numFulfilled = 0, numRequired = 3 } } } }
+    local mplan = fullPlan(ns)
+    local o = mplan and mplan.byId["O810:1"]
+    check("cluster: a log quest's objective is placed on its NPC's continent", o and o.loc and o.loc.cont == 0,
+        o and o.loc and o.loc.cont)
+    M.log = {}
+
+    -- retired flight points
+    check("flights: \"zz\" nodes are retired test points", ns.Travel.IsRetiredNode("zzOLDPowderfuse Port, Riverglades")
+        and not ns.Travel.IsRetiredNode("Ratchet, The Barrens") and not ns.Travel.IsRetiredNode(nil))
+    M.player.mapId, M.player.x, M.player.y = 1429, 0.42, 0.41
+    M.taxiNodes = {
+        { name = "zzOLDPowderfuse Port, Riverglades", position = { x = 0.50, y = 0.405 }, faction = 2, nodeID = 9 },
+        { name = "Ratchet, The Barrens", position = { x = 0.50, y = 0.405 }, faction = 2, nodeID = 10 },
+    }
+    local net = ns.Travel.BuildNetwork(ns.QuestState.Player())
+    local names = {}
+    for _, n in ipairs(net.nodes) do names[#names + 1] = n.name end
+    check("flights: a retired node never makes the network", #net.nodes == 1 and names[1] == "Ratchet, The Barrens",
+        table.concat(names, ","))
+    M.taxiNodes = {}
+end
+
+---------------------------------------------------------------------------
+-- 15m. 0.4.0: "once my character gets to a certain level (+3 to 4) above the area's proposed
+-- quests, it may be time to move on from some of my older quests that are from a lower level."
+-- Outgrown quests in your log get the "worth the trip" check; the hint box says what to drop
+-- and, in a quest dialog, which quests to take.
+---------------------------------------------------------------------------
+do
+    local ns = setup()
+    local P, L, H = ns.Planner, ns.Ladder, ns.Hints
+    local function pt(x, y, cont) return { cont = cont or 0, wx = x, wy = y, mapId = 1, x = 0, y = 0 } end
+    local hub = pt(0, 0)
+    local function obj(x, y, cont) return { { index = 1, type = "monster", need = 1, have = 0, finished = false, loc = pt(x, y, cont) } } end
+    local function logq(id, title, objectives, xp, extra)
+        local q = { id = id, title = title, turnin = hub, objectives = objectives or {}, outgrown = true, tripXP = xp, level = 12 }
+        for k, v in pairs(extra or {}) do q[k] = v end
+        return q
+    end
+    -- walking at 7 yd/s; another continent is a 900 s crossing
+    local function walk(a, b)
+        if a.cont ~= b.cont then return 900 end
+        return math.sqrt((a.wx - b.wx) ^ 2 + (a.wy - b.wy) ^ 2) / 7
+    end
+    local function ctx(active, candidates)
+        return { start = hub, level = 17, tripCheck = true, logCount = #active, logMax = 40, travel = walk,
+                 active = active, candidates = candidates or {} }
+    end
+    local plan = P.Plan(ctx({
+        logq(30, "Old Far Camp", obj(-2000, 0), 600),
+        logq(31, "Old Next Door", obj(100, 0), 600),
+        logq(32, "At Your Level, Far", obj(0, -2000), 600, { outgrown = false, tripXP = nil, level = 17 }),
+        logq(33, "Old Class Quest, Far", obj(2000, 0), 100, { keep = true }),
+        logq(34, "Old, Ready To Turn In, Far", {}, 300, { complete = true, turnin = pt(0, 2200) }),
+    }))
+    local out, inOrder = {}, {}
+    for _, p in ipairs(plan.outgrown) do out[p.questId] = p end
+    for _, t in ipairs(plan.order) do inOrder[t.questId or -1] = true end
+    local function list(set) local o = {} for id in pairs(set) do o[#o + 1] = id end table.sort(o) return table.concat(o, ",") end
+    check("outgrown: an old quest the route would walk 2000 yd for is left out", out[30] and not inOrder[30], list(out))
+    check("outgrown: ...and so is an old turn-in far away", out[34] and not inOrder[34], list(out))
+    check("outgrown: an old quest on the way stays", inOrder[31] and not out[31])
+    check("outgrown: a quest at your level stays however far", inOrder[32] and not out[32])
+    check("outgrown: a class quest stays", inOrder[33] and not out[33])
+    check("outgrown: they're listed apart from new quests", #plan.pruned == 0 and out[30] and out[30].inLog == true)
+    check("outgrown: the route left is valid", P.IsValid(plan.order, { logCount = 5, logMax = 40 }))
+    check("outgrown: they don't count as left out for log space", plan.dropped == 0, plan.dropped)
+
+    -- one ocean crossing carries two old quests that each look cheap on their own: weighed together
+    local away = P.Plan(ctx({
+        logq(40, "Old Quest Over The Sea, West", obj(0, 0, 1), 2500, { turnin = pt(0, 0, 1) }),
+        logq(41, "Old Quest Over The Sea, East", obj(3000, 0, 1), 2500, { turnin = pt(3000, 0, 1) }),
+        logq(42, "Here", obj(50, 0), 600, { outgrown = false, tripXP = nil, level = 17 }),
+    }))
+    local gone = {}
+    for _, p in ipairs(away.outgrown) do gone[p.questId] = p end
+    check("outgrown: two quests across the sea go together", gone[40] and gone[41] and gone[40].together == 2, list(gone))
+    -- ...but not when one of them is still at your level: the trip happens anyway
+    local stay = P.Plan(ctx({
+        logq(40, "Old Quest Over The Sea, West", obj(0, 0, 1), 2500, { turnin = pt(0, 0, 1) }),
+        logq(41, "At Your Level Over The Sea", obj(3000, 0, 1), 2500, { turnin = pt(3000, 0, 1), outgrown = false, tripXP = nil }),
+    }))
+    check("outgrown: with an at-level quest over there, the old one rides along", #stay.outgrown == 0, #stay.outgrown)
+    -- a new quest that only follows an outgrown one goes with it
+    local chain = P.Plan(ctx({ logq(50, "Old Breadcrumb, Far", obj(-2000, 0), 300) },
+        { { id = 51, title = "Its Follow-up", pickup = hub, turnin = hub, objectives = obj(-2050, 0), tripXP = 400, after = { 50 } } }))
+    local cgone = {}
+    for _, p in ipairs(chain.outgrown) do cgone[p.questId] = true end
+    for _, p in ipairs(chain.pruned) do cgone[p.questId] = true end
+    check("outgrown: its follow-up goes with it", cgone[50] and cgone[51], list(cgone))
+    local off = ctx({ logq(30, "Old Far Camp", obj(-2000, 0), 600) })
+    off.tripCheck = nil
+    check("outgrown: /ladder trips off keeps them", #P.Plan(off).outgrown == 0)
+
+    -- the full pipeline: which quests in your log count as outgrown (3+ levels under you)
+    local D = ns.Data
+    D.InitWith(M.fakeDB({
+        quests = {
+            [960] = { name = "Old Murlocs", startedBy = { { 600 } }, finishedBy = { { 600 } }, requiredLevel = 1, questLevel = 12,
+                      objectives = { { { 610 } } } },
+            [961] = { name = "Nearly Current", startedBy = { { 600 } }, finishedBy = { { 600 } }, requiredLevel = 1, questLevel = 16,
+                      objectives = { { { 611 } } } },
+            [962] = { name = "Old Class Errand", startedBy = { { 600 } }, finishedBy = { { 600 } }, requiredLevel = 1, questLevel = 10,
+                      requiredClasses = 1, objectives = { { { 611 } } } },
+            [963] = { name = "Old Breadcrumb", startedBy = { { 600 } }, finishedBy = { { 601 } }, requiredLevel = 1, questLevel = 12,
+                      objectives = {} },
+            [964] = { name = "Good Follow-up", startedBy = { { 601 } }, finishedBy = { { 601 } }, requiredLevel = 14, questLevel = 18,
+                      objectives = {}, preQuestSingle = { 963 } },
+        },
+        questXP = { [960] = { 12, 500 }, [961] = { 16, 1200 }, [962] = { 10, 400 }, [963] = { 12, 200 }, [964] = { 18, 1500 } },
+        npcs = {
+            [600] = { name = "Old Giver", spawns = spawn(42, 41) },
+            [601] = { name = "Far Contact", spawns = spawn(90, 90) },
+            [610] = { name = "Murloc", spawns = spawn(85, 85) },
+            [611] = { name = "Boar", spawns = spawn(44, 42) },
+        },
+        objects = {}, items = {},
+    }))
+    M.player.level = 18
+    M.log = {
+        { id = 960, title = "Old Murlocs", level = 12, complete = false,
+          objectives = { { text = "Murloc slain: 0/5", type = "monster", finished = false, numFulfilled = 0, numRequired = 5 } } },
+        { id = 961, title = "Nearly Current", level = 16, complete = false,
+          objectives = { { text = "Boar slain: 0/5", type = "monster", finished = false, numFulfilled = 0, numRequired = 5 } } },
+        { id = 962, title = "Old Class Errand", level = 10, complete = false,
+          objectives = { { text = "Boar slain: 0/1", type = "monster", finished = false, numFulfilled = 0, numRequired = 1 } } },
+        { id = 963, title = "Old Breadcrumb", level = 12, complete = true, objectives = {} },
+    }
+    local fp = fullPlan(ns)
+    local act = {}
+    for _, q in ipairs((fp and fp.active) or {}) do act[q.id] = q end
+    check("outgrown: 3+ levels under you counts (12 at 18)", act[960] and act[960].outgrown == true)
+    check("outgrown: 2 under doesn't (16 at 18)", act[961] and not act[961].outgrown)
+    check("outgrown: a class quest never does", act[962] and not act[962].outgrown)
+    check("outgrown: its XP is what it gives you now", act[960] and math.abs((act[960].tripXP or 0) - 400) < 1, act[960] and act[960].tripXP)
+    -- a breadcrumb into a good quest: the follow-up is planned after it, so dropping the
+    -- breadcrumb would drop the follow-up too and its XP counts there; when the follow-up isn't
+    -- planned yet, the breadcrumb carries its XP
+    local follow
+    for _, c in ipairs((fp and fp.candidates) or {}) do if c.id == 964 then follow = c end end
+    check("outgrown: the breadcrumb's follow-up is planned after it", follow and follow.after and follow.after[1] == 963
+        and act[963] and act[963].outgrown and math.abs((act[963].tripXP or 0) - 160) < 1, act[963] and act[963].tripXP)
+    local crumb = { { id = 963, title = "Old Breadcrumb", level = 12, complete = true, objectives = {} } }
+    L.MarkOutgrown(crumb, ns.QuestState.Player(), {})
+    check("outgrown: a breadcrumb into a good quest not planned yet carries that quest's XP",
+        crumb[1].outgrown and (crumb[1].tripXP or 0) >= 1500, crumb[1].tripXP)
+    local fout = {}
+    for _, p in ipairs((fp and fp.outgrown) or {}) do fout[p.questId] = true end
+    check("outgrown: the far old murlocs are left out of the route", fout[960] == true, list(fout))
+
+    -- the hint box: what to abandon, and with a full log, what to drop first
+    local function hintWith(p, needle)
+        for _, h in ipairs(H.Compute({ plan = p, byId = {}, bags = ns.QuestState.Bags(), now = M.time })) do
+            if h.text:find(needle, 1, true) then return h end
+        end
+    end
+    local hp = { player = ns.QuestState.Player(), outgrown = { { questId = 960, title = "Old Murlocs", xp = 400, seconds = 400,
+        quest = { level = 12 } } }, pruned = {}, logCount = 30, logMax = 40, active = {} }
+    local oh = hintWith(hp, "Outgrown:")
+    check("outgrown: the hint names it and says to abandon it", oh and oh.text:find("Old Murlocs", 1, true)
+        and oh.text:find("[12]", 1, true) and oh.text:find("abandon it to free log space (log 30/40)", 1, true), oh and oh.text)
+    local full = { player = hp.player, outgrown = {}, pruned = {}, logCount = 39, logMax = 40, active = {
+        { id = 70, title = "Old Started", level = 12, outgrown = true, tripXP = 300,
+          objectives = { { numFulfilled = 2, finished = false } } },
+        { id = 71, title = "Old Untouched", level = 12, outgrown = true, tripXP = 500, objectives = { { numFulfilled = 0 } } },
+        { id = 72, title = "Older Untouched", level = 10, outgrown = true, tripXP = 200, objectives = {} },
+        { id = 73, title = "Current", level = 17, objectives = {} },
+    } }
+    local fh = hintWith(full, "Quest log 39/40:")
+    check("log full: names the weakest to drop, least XP first",
+        fh and fh.text:find("Older Untouched", 1, true) and fh.text:find("Old Untouched", 1, true)
+        and fh.text:find("Older Untouched", 1, true) < fh.text:find("Old Untouched", 1, true), fh and fh.text)
+    check("log full: never a quest you've started or one at your level", fh and not fh.text:find("Old Started", 1, true)
+        and not fh.text:find("Current", 1, true))
+    full.logCount = 30
+    check("log full: quiet while there's room", hintWith(full, "Quest log") == nil)
+    local lines = table.concat(L.SkippedLines(hp), "\n")
+    check("outgrown: /ladder outgrown lists them", lines:find("Outgrown, in your log but not worth the trip any more (1)", 1, true)
+        and lines:find("Old Murlocs [12] - 400 XP", 1, true), lines)
+    full.logCount = 40
+    local fl = table.concat(L.SkippedLines(full), "\n")
+    check("log full: /ladder outgrown lists the weakest too", fl:find("Your log is 40/40. Weakest to drop first:", 1, true)
+        and fl:find("Older Untouched [10] - 200 XP, outgrown, not started", 1, true), fl)
+    M.log = {}
+end
+
+---------------------------------------------------------------------------
+-- 15n. 0.4.0: take it or leave it, in a quest dialog
+---------------------------------------------------------------------------
+do
+    local ns = setup()
+    local L, H, D = ns.Ladder, ns.Hints, ns.Data
+    local function q(name, level, xp) return { name = name, startedBy = { { 600 } }, finishedBy = { { 600 } }, requiredLevel = 1,
+                                             questLevel = level, objectives = {} } end
+    D.InitWith(M.fakeDB({
+        quests = { [950] = q("Planned Pickup", 17), [951] = q("Dropped Before", 17), [952] = q("Too High", 22),
+                   [953] = q("Grey", 5), [954] = q("Far Trip", 17), [955] = q("Tiny", 17), [956] = q("Worth It", 17),
+                   [957] = q("Low XP", 17) },
+        questXP = { [950] = { 17, 1400 }, [951] = { 17, 1400 }, [952] = { 22, 2000 }, [953] = { 5, 100 }, [954] = { 17, 1400 },
+                    [955] = { 17, 1400 }, [956] = { 17, 1400 }, [957] = { 17, 40 } },
+        npcs = { [600] = { name = "Giver", spawns = spawn(42, 41) } }, objects = {}, items = {},
+    }))
+    M.player.level = 17
+    ns.db.autoAccept = false
+    ns.charDB.ignored[951] = true
+    L.plan = { player = ns.QuestState.Player(), steps = { { tasks = {} }, { tasks = { { kind = "pickup", questId = 950 } } } },
+               pruned = { { questId = 954, xp = 900, seconds = 600 } }, skippedLowValue = { { id = 955, xp = 200 } },
+               logCount = 20, logMax = 40 }
+    local function v(id) local take, why = L.QuestVerdict(id) return take, why or "" end
+    local take, why = v(950)
+    check("verdict: a quest on your route: take it, and which step", take == true and why:find("step 2", 1, true), why)
+    take, why = v(951)
+    check("verdict: one you dropped: skip, and how to undo", take == false and why:find("/ladder unignore 951", 1, true), why)
+    take, why = v(952)
+    check("verdict: too high", take == false and why:find("level 22 is too high", 1, true), why)
+    take, why = v(953)
+    check("verdict: grey", take == false and why:find("grey for you", 1, true), why)
+    take, why = v(954)
+    check("verdict: not worth the walk, with the numbers", take == false and why:find("900 XP for 10:00 of travel", 1, true), why)
+    take, why = v(955)
+    check("verdict: too little XP", take == false and why:find("too little XP", 1, true), why)
+    take, why = v(956)
+    check("verdict: worth it but not planned: take it", take == true and why:find("route adds it", 1, true), why)
+    take, why = v(957)
+    check("verdict: not worth it and not planned: skip", take == false, why)
+    L.plan.logCount = 40
+    take, why = v(956)
+    check("verdict: a full log: skip, and where to look", take == false and why:find("log is full (40/40)", 1, true), why)
+    L.plan.logCount = 20
+    check("verdict: nothing to say about a secret or unknown id", L.QuestVerdict(nil) == nil and L.QuestVerdict(99999) == nil)
+
+    -- the dialog lines in the hint box
+    local function find(needle)
+        for _, h in ipairs(H.Compute({ plan = L.plan, byId = {}, bags = ns.QuestState.Bags(), now = M.time })) do
+            if h.text:find(needle, 1, true) then return h end
+        end
+    end
+    _G.GetQuestID = function() return 956 end
+    ns.DispatchEvent("QUEST_DETAIL")
+    local line = find("Worth It")
+    check("dialog: the quest text gets a Take line", line and line.text:find("Take:", 1, true), line and line.text)
+    ns.DispatchEvent("QUEST_FINISHED")
+    check("dialog: gone when the dialog closes", find("Worth It") == nil)
+    _G.C_GossipInfo = { GetAvailableQuests = function() return { { questID = 950 }, { questID = 953 } } end }
+    ns.DispatchEvent("GOSSIP_SHOW")
+    local a, b = find("Planned Pickup"), find("Grey")
+    check("dialog: a gossip list gets a line per quest", a and a.text:find("Take:", 1, true) and b and b.text:find("Skip:", 1, true),
+        (a and a.text or "-") .. " / " .. (b and b.text or "-"))
+    check("dialog: takes come first", a and b and a.priority > b.priority)
+    _G.GetQuestID = function() return 950 end
+    ns.DispatchEvent("QUEST_DETAIL")
+    ns.DispatchEvent("GOSSIP_CLOSED") -- the gossip window closes after the quest text opened
+    check("dialog: closing the gossip list keeps the quest text's line", find("Planned Pickup") ~= nil and find("Grey") == nil)
+    ns.DispatchEvent("QUEST_FINISHED")
+    check("dialog: and that goes with the quest text", find("Planned Pickup") == nil)
+    _G.GetQuestID, _G.C_GossipInfo = nil, nil
+    ns.charDB.ignored[951] = nil
+    ns.db.autoAccept = true
+end
+
+do
+    -- the whole pipeline at a Barrens-like hub: XP from QuestieDB, a quest 1,500 yards out
+    local ns = setup()
+    local D, L = ns.Data, ns.Ladder
+    M.player.level = 17
+    local xp = {}
+    for id = 9001, 9030 do xp[id] = { 17, 1350 } end
+    local function q(name, mob, extra)
+        local t = { name = name, startedBy = { { 400 } }, finishedBy = { { 400 } }, requiredLevel = 1, questLevel = 17,
+                    objectives = { { { mob } } } }
+        for k, v in pairs(extra or {}) do t[k] = v end
+        return t
+    end
+    local quests = {
+        [801] = q("Near Errand", 420),
+        [802] = q("Long Walk", 421),
+        [803] = q("Class Trip", 422, { requiredClasses = 1 }),
+    }
+    xp[801], xp[802], xp[803] = { 17, 1350 }, { 17, 1350 }, { 17, 150 }
+    D.InitWith(M.fakeDB({
+        quests = quests, questXP = xp,
+        npcs = {
+            [400] = { name = "Hub Giver", spawns = spawn(43, 42) },
+            [420] = { name = "Near Mob", minLevel = 16, spawns = spawn(45, 44) },
+            [421] = { name = "Far Mob", minLevel = 16, spawns = spawn(95, 45) },
+            [422] = { name = "Other Far Mob", minLevel = 16, spawns = spawn(2, 45) },
+        },
+        objects = {}, items = {},
+    }))
+    local plan = (function()
+        local built = false
+        D.BuildIndexes(ns.QuestState.Player(), function() built = true end)
+        L.Rebuild("barrens")
+        return L.plan
+    end)()
+    local inOrder, pruned = {}, {}
+    for _, t in ipairs((plan and plan.order) or {}) do if t.kind == "pickup" then inOrder[t.questId] = true end end
+    for _, p in ipairs((plan and plan.pruned) or {}) do pruned[p.questId] = p end
+    check("barrens: the quest next to the hub is planned", inOrder[801])
+    check("barrens: the solid quest 1,500 yards out isn't worth the walk", pruned[802] and not inOrder[802]
+        and pruned[802].xp == 1350, pruned[802] and pruned[802].seconds)
+    check("barrens: a class quest out there stays (never dropped for distance)", inOrder[803] and not pruned[803])
+    local c803
+    for _, c in ipairs(plan.candidates) do if c.id == 803 then c803 = c end end
+    check("barrens: class quests are marked keep", c803 and c803.keep and c803.worthWhy == "class")
+    local hints = ns.Hints.Compute({ plan = plan, byId = {}, bags = ns.QuestState.Bags(), now = M.time })
+    local hinted = false
+    for _, h in ipairs(hints) do if h.text:find("1 quest here is not worth the walk", 1, true) then hinted = true end end
+    check("barrens: the hint box says a quest was skipped", hinted)
+    local text = table.concat(L.SkippedLines(plan), "\n")
+    check("barrens: /ladder skipped names it", text:find("Long Walk - 1350 XP", 1, true) and text:find("killing mobs that long", 1, true), text)
+    _G.SlashCmdList.QUESTLADDER("trips")
+    check("barrens: /ladder trips turns the check off", ns.db.tripCheck == false)
+    L.Rebuild("barrens off")
+    inOrder = {}
+    for _, t in ipairs(L.plan.order) do if t.kind == "pickup" then inOrder[t.questId] = true end end
+    check("barrens: and then the far quest is planned again", inOrder[802] and #L.plan.pruned == 0)
+    _G.SlashCmdList.QUESTLADDER("trips")
+    check("barrens: and back on", ns.db.tripCheck == true)
+
+    -- what a quest is worth for the check
+    local player = ns.QuestState.Player()
+    local function tv(id, why, planned)
+        local c = { id = id }
+        L.SetTripValue(c, why, player, planned or {})
+        return c
+    end
+    check("trip value: its XP at your level", tv(801).tripXP == 1350 and not tv(801).keep)
+    check("trip value: unknown XP counts as a solid quest", tv(899).tripXP == 1350, tv(899).tripXP)
+    check("trip value: upgrades and must-do quests are kept", tv(801, "upgrade").keep and tv(801, "goodie").keep)
+    check("trip value: a class quest is kept even when its XP alone gets it planned (no reason given)",
+        tv(803).keep and tv(803).worthWhy == "class")
+    D.followUps[801] = { 802 }
+    check("trip value: a breadcrumb is worth its follow-up too", tv(801, "leads on").tripXP == 2700)
+    check("trip value: unless that follow-up is planned (it's weighed with it)", tv(801, "leads on", { [802] = true }).tripXP == 1350)
+    D.followUps[801] = nil
+
+    -- "/ladder dungeons" lists, "/ladder dungeons plan" toggles (0.3.20 hid the toggle)
+    local before = ns.db.skipDungeonQuests
+    _G.SlashCmdList.QUESTLADDER("dungeons")
+    check("dungeons: the list doesn't change the setting", ns.db.skipDungeonQuests == before)
+    _G.SlashCmdList.QUESTLADDER("dungeons plan")
+    check("dungeons: \"plan\" toggles planning them", ns.db.skipDungeonQuests == not before)
+    _G.SlashCmdList.QUESTLADDER("dungeons plan")
+    check("dungeons: and back", ns.db.skipDungeonQuests == before)
+    _G.SlashCmdList.QUESTLADDER("skipped") -- prints without an error
+end
+
+---------------------------------------------------------------------------
+-- 15h. 0.3.22: "stop trying to mark my reagents as sell/destroy. That stuff is good money /
+-- bankable." And a "speak to Neeru Fireblade" objective (a friendly level-37 NPC in QuestieDB)
+-- held a level-12 quest back until 37 more turn-ins, sending you across the ocean and back.
+---------------------------------------------------------------------------
+do
+    local ns = setup()
+    M.items[1001] = { name = "Linen Cloth", classID = 7, subClassID = 5, quality = 1, sell = 13 }
+    M.items[1002] = { name = "Peacebloom", classID = 7, subClassID = 9, quality = 1, sell = 1 }
+    M.items[1003] = { name = "Small Venom Sac", classID = 12, quality = 1, sell = 0, reagent = true } -- a quest-type item the game calls a reagent
+    M.items[1004] = { name = "Recipe: Spiced Wolf Meat", classID = 9, quality = 1, sell = 10 }
+    M.items[1005] = { name = "Moonstone", classID = 3, quality = 2, sell = 150 }
+    M.items[1006] = { name = "Red Wolf Fang", classID = 15, subClassID = 1, quality = 1, sell = 4 }
+    M.items[1007] = { name = "Chipped Claw", classID = 15, quality = 0, sell = 6 }
+    M.items[1008] = { name = "Dusty Gray Reagent", classID = 15, quality = 0, sell = 3, reagent = true }
+    M.items[1009] = { name = "Plain Pebble", classID = 15, quality = 1, sell = 2 }
+    M.bag = {}
+    for id = 1001, 1009 do M.bag[#M.bag + 1] = { id = id, count = 5 } end
+    local function suggest(needed)
+        local list = ns.Bags.Suggestions(ns.QuestState.Bags(), {}, { bags = { needed = needed }, candidates = {},
+            player = { level = 17, classFile = "PALADIN" } })
+        local by = {}
+        for _, e in ipairs(list) do by[e.itemId] = e end
+        return by
+    end
+    local by = suggest(4)
+    local function never(id) return not by[id] or (by[id].action ~= "sell" and by[id].action ~= "destroy") end
+    check("materials: cloth and herbs are never Sell", never(1001) and never(1002), by[1001] and by[1001].action)
+    check("materials: a quest-type item the game flags as a reagent is never Destroy", never(1003), by[1003] and by[1003].action)
+    check("materials: recipes, gems and misc reagents are never Sell", never(1004) and never(1005) and never(1006))
+    check("materials: when bags are short they go to the bank", by[1001] and by[1001].action == "bank"
+        and by[1001].reason:find("crafting material", 1, true), by[1001] and by[1001].reason)
+    check("materials: a gray the game flags as a reagent isn't junk", never(1008))
+    check("materials: plain gray junk is still Sell", by[1007] and by[1007].action == "sell")
+    check("materials: a plain white misc item can still go when bags are short", by[1009] and by[1009].action == "sell")
+    by = suggest(0)
+    check("materials: nothing suggested while there's room", not by[1001] and not by[1003] and not by[1006])
+    -- a vendor stop counts only what can be sold
+    ns.Ladder.plan = { bags = { needed = 4 }, candidates = {}, player = { level = 17, classFile = "PALADIN" } }
+    check("materials: a vendor stop doesn't count them as sellable", ns.Bags.SellableSlots(ns.QuestState.Bags()) == 2,
+        ns.Bags.SellableSlots(ns.QuestState.Bags()))
+    ns.Ladder.plan = nil
+    M.bag = {}
+
+    -- friendly NPCs are talks, not fights
+    ns.Data.InitWith(M.fakeDB({
+        quests = {}, objects = {}, items = {},
+        npcs = {
+            [3216] = { name = "Neeru Fireblade", minLevel = 37, friendlyToFaction = "H", spawns = spawn(50, 50) },
+            [3217] = { name = "Neutral Goblin", minLevel = 40, friendlyToFaction = "AH", spawns = spawn(50, 50) },
+            [3218] = { name = "Burning Blade Thug", minLevel = 37, spawns = spawn(50, 50) },
+            [3219] = { name = "Alliance Guard", minLevel = 55, friendlyToFaction = "A", spawns = spawn(50, 50) },
+        },
+    }))
+    local L = ns.Ladder
+    local function lvl(npc, faction) return L.MobLevelOf({ type = "monster", targets = { npc = { npc } } }, faction) end
+    check("mob level: \"speak to Neeru Fireblade\" (friendly to the Horde) holds nothing back", lvl(3216, "Horde") == nil)
+    check("mob level: an NPC friendly to both factions neither", lvl(3217, "Horde") == nil and lvl(3217, "Alliance") == nil)
+    check("mob level: a hostile mob still counts", lvl(3218, "Horde") == 37)
+    check("mob level: the other faction's guard is a fight", lvl(3219, "Horde") == 55 and lvl(3219, "Alliance") == nil)
+    check("mob level: unknown faction: counted as before", lvl(3216, nil) == 37)
+end
+
+---------------------------------------------------------------------------
+-- 15i. 0.3.22: timed quests ("Apothecary Zamah: bring the Rendered Spores to Thunder Bluff
+-- before the time limit is up") go first, with a countdown and the item in the guide.
+---------------------------------------------------------------------------
+do
+    local ns = setup()
+    local P = ns.Planner
+    local function pt(x, y) return { cont = 0, wx = x, wy = y, mapId = 1, x = 0, y = 0 } end
+    local hub = pt(0, 0)
+    local function obj(x, y, mob) return { { index = 1, type = "monster", need = 1, have = 0, loc = pt(x, y), mobLevel = mob } } end
+    local function ctx(extra)
+        local c = { start = hub, level = 17, logCount = 3, logMax = 40, active = {
+            { id = 1, title = "Next Door", objectives = obj(100, 0), turnin = hub },
+            { id = 2, title = "Over There", objectives = obj(50, 50), turnin = hub },
+            { id = 853, title = "Apothecary Zamah", complete = true, objectives = {}, turnin = pt(3000, 0), timed = true },
+        } }
+        for k, v in pairs(extra or {}) do c[k] = v end
+        return c
+    end
+    local plan = P.Plan(ctx())
+    check("timed: the timed quest's turn-in goes first, far as it is", plan.order[1].id == "T853", plan.order[1].id)
+    check("timed: the rest follows, and the route is valid", #plan.order == 5 and P.IsValid(plan.order, { logCount = 3, logMax = 40 }))
+    local offCtx = ctx()
+    offCtx.active[3].timed = nil
+    check("timed: without a clock it would be done last", P.Plan(offCtx).order[5].id == "T853")
+    local gated = ctx()
+    gated.active[3] = { id = 854, title = "Kill Them In Time", objectives = obj(2500, 0, 25), turnin = pt(2600, 0), timed = true }
+    plan = P.Plan(gated)
+    check("timed: a high-level mob doesn't hold a timed quest back", plan.order[1].id == "O854:1" and plan.order[2].id == "T854",
+        plan.order[1].id .. " " .. plan.order[2].id)
+    local skipped = ctx()
+    skipped.active[3].deferred = true
+    check("timed: one you skipped (/ladder skip) isn't rushed", P.Plan(skipped).order[1].id ~= "T853")
+    -- a vendor stop its step waits for comes along first
+    local vendored = ctx({ extraTasks = { { id = "V:vendor", kind = "visit", visit = "vendor", loc = pt(2000, 0), est = 30, deps = {} } },
+                           extraDeps = { T853 = { "V:vendor" } } })
+    plan = P.Plan(vendored)
+    check("timed: what it waits for comes along", plan.order[1].id == "V:vendor" and plan.order[2].id == "T853",
+        plan.order[1].id .. " " .. plan.order[2].id)
+    check("timed: LastUrgent finds the end of the rush", P.LastUrgent(plan.order) == 2)
+
+    -- reading the timer
+    M.log = { { id = 853, title = "Apothecary Zamah", level = 15, complete = true, objectives = {} } }
+    local timers = { [853] = { 2700, 300 } }
+    _G.C_QuestLog.GetTimeAllowed = function(id) local t = timers[id]; if t then return t[1], t[2] end end
+    local _, byId = ns.QuestState.Snapshot()
+    local tm = byId[853].timer
+    check("timer: read from the game, with when it was read", tm and tm.total == 2700 and tm.elapsed == 300
+        and tm.readAt == M.time and tm.source == "api", tm and tm.source)
+    _G.issecretvalue = function(v) return v == 2700 end
+    _, byId = ns.QuestState.Snapshot()
+    check("timer: a secret value is never used", byId[853].timer == nil)
+    _G.issecretvalue = function() return false end
+    timers = {}
+    _G.GetQuestTimers = function() return 1500 end
+    _G.GetQuestIndexForTimer = function(i) return i == 1 and 1 or nil end
+    _, byId = ns.QuestState.Snapshot()
+    tm = byId[853].timer
+    check("timer: the older timer API when the new one says nothing", tm and tm.total == 1500 and tm.source == "legacy",
+        tm and tm.source)
+    _G.GetQuestTimers, _G.GetQuestIndexForTimer = nil, nil
+
+    -- the whole pipeline: a finished timed quest far away, kobolds right here, a flight path on the way
+    M.log = {
+        { id = 2, title = "Kobold Camp Cleanup", level = 2, complete = false,
+          objectives = { { text = "Kobold Vermin slain: 2/6", type = "monster", finished = false, numFulfilled = 2, numRequired = 6 } } },
+        { id = 3, title = "The Lost Book", level = 3, complete = true,
+          objectives = { { text = "Old Book: 1/1", type = "item", finished = true, numFulfilled = 1, numRequired = 1 } } },
+    }
+    timers = { [3] = { 600, 100 } }
+    M.taxiNodes = { { name = "Field Post", position = { x = 0.43, y = 0.41 }, isUndiscovered = true, faction = 2, nodeID = 2 } }
+    local full = fullPlan(ns)
+    local first = full.steps[1].tasks[1]
+    check("timed: in the guide the timed turn-in is step 1", first.id == "T3", first.id)
+    local fpFirst = false
+    for _, t in ipairs(full.steps[1].tasks) do if t.visit == "flight" then fpFirst = true end end
+    check("timed: no flight-path detour before it", not fpFirst)
+    local L = ns.Ladder
+    local list = L.TimedQuests()
+    check("timed: listed with the time left", #list == 1 and list[1].questId == 3 and math.abs(list[1].left - 500) < 0.01,
+        list[1] and list[1].left)
+    local text = L.TimerText(list[1])
+    check("timed: the line shows the clock, the item and where it goes", text:find("8:20|r left", 1, true)
+        and text:find("[Old Book]", 1, true) and text:find("to Librarian Mae", 1, true) and text:find("it goes first", 1, true), text)
+    M.time = M.time + 60
+    check("timed: it counts down every second", L.TimerText(L.TimedQuests()[1]):find("7:20|r left", 1, true))
+    M.time = M.time + 340
+    check("timed: red in the last two minutes", L.TimerText(L.TimedQuests()[1]):find("|cffff55551:40|r", 1, true),
+        L.TimerText(L.TimedQuests()[1]))
+    M.time = M.time + 100
+    check("timed: and says when time is up", L.TimerText(L.TimedQuests()[1]):find("time's up", 1, true))
+    L.snapshot = {}
+    check("timed: gone once it's out of your log", #L.TimedQuests() == 0)
+    M.taxiNodes = {}
+
+    -- the quest text alone says there's a clock
+    check("timed: 'before the time limit is up' in the quest text counts", L.TimedByText({ objectivesText =
+        { "Bring the Rendered Spores to Apothecary Zamah in Thunder Bluff, before the time limit is up." } }))
+    check("timed: ordinary quest text doesn't", not L.TimedByText({ objectivesText = { "Collect 8 Witchwing talons." } }))
+    text = L.TimerText({ title = "Apothecary Zamah", left = nil, done = true, to = "Apothecary Zamah" })
+    check("timed: no timer from the game: it points at the quest log", text:find("see the timer in your quest log", 1, true), text)
+    _G.C_QuestLog.GetTimeAllowed = function() return nil end
+end
+
+---------------------------------------------------------------------------
+-- 15j. 0.3.24: more than one first guess. At Sun Rock Retreat (your 13:34 diag, level 18) the
+-- route walked off to the north Barrens and flew back for two turn-ins 150 yards from you; the
+-- improvement step couldn't untangle the first guess. The real tasks and flight points from that
+-- diag (replay format: id|kind|deps|cont|x|y|est|flags|mobLevel|xpWeight).
+---------------------------------------------------------------------------
+do
+    local ns = setup()
+    local P, T = ns.Planner, ns.Travel
+    local SUN_ROCK = {
+        "O6461:2|objective||1|510.7|644.8|120||17|", "O6461:1|objective||1|448.7|577.5|200||16|",
+        "O6421:2|objective||1|2.0|402.8|15|||", "O6421:1|objective||1|-62.0|329.2|280|||",
+        "T6461|turnin|O6461:1,O6461:2|1|-177.4|-233.5|8|||1", "O6629:1|objective||1|112.4|-350.7|20||18|",
+        "O875:1|objective||1|670.0|-1287.3|168||16|", "T6541|turnin||1|1246.3|-2253.2|8|||0.4",
+        "O881:1|objective||1|451.1|-3037.6|28||16|", "O6301:1|objective||1|1479.3|848.8|280|||",
+        "T6301|turnin|O6301:1|1|1015.7|928.2|8|||1", "T6421|turnin|O6421:1,O6421:2|1|831.4|939.9|8|||1",
+        "O1062:1|objective||1|1244.9|22.7|300||18|", "O6629:2|objective||1|114.8|-559.4|120||15|",
+        "T6629|turnin|O6629:1,O6629:2|1|-263.0|-943.0|8|||1", "T1062|turnin|O1062:1|1|-271.1|-950.1|8|||1",
+        "O899:1|objective||1|-1455.6|-1534.0|1680||16|", "O4921:1|objective||1|-1787.2|-2375.9|20|||",
+        "O3281:1|objective||1|-2027.1|-3258.5|28|||", "T1492|turnin||1|-985.3|-3796.5|8|||1",
+        "V:fp:Ratchet|visit||1|-894.6|-3773.0|15|v:flight||", "O877:1|objective||1|-1275.8|-3012.2|12|||",
+        "T877|turnin|O877:1|1|-544.8|-2672.8|8|||1", "T899|turnin|O899:1|1|-521.1|-2641.3|8|||1",
+        "T4921|turnin|O4921:1|1|-521.1|-2641.3|8|||1", "T881|turnin|O881:1|1|-482.6|-2669.7|8|||1",
+        "T3281|turnin|O3281:1|1|-436.0|-2639.3|8|||1", "T875|turnin|O875:1|1|-475.2|-2607.9|8|||1",
+        "O5726:1|objective||1|1479.9|-4760.2|28||9|", "T5726|turnin|O5726:1|1|1920.1|-4125.6|8|||1",
+        "V:hearth1|visit||0|2268.1|244.0|25|tv:hearth||", "T441|turnin||0|1604.3|278.3|8|||1",
+        "T5725|turnin||0|1287.8|333.5|8|||1", "O443:1|objective||0|981.6|683.6|224||16|",
+        "O424:1|objective||0|410.6|989.6|28||15|", "O95981:1|objective||0|34.4|739.3|160|||",
+        "O95981:2|objective||0|35.6|765.3|160|||", "O450:1|objective||0|-382.4|1644.8|28|||",
+        "T443|turnin|O443:1|0|522.6|1652.4|8|||1", "T450|turnin|O450:1|0|522.6|1652.4|8|||1",
+        "T424|turnin|O424:1|0|552.0|1593.6|8|||1", "T95981|turnin|O95981:1,O95981:2|0|520.6|1602.8|8|||1",
+        "O479:1|objective||0|-154.2|965.7|224|d||", "T479|turnin|O479:1|0|520.6|1602.8|8|d||1",
+    }
+    local function pt(c, x, y) return { cont = c, wx = x, wy = y } end
+    local net = { speed = 7, nodes = {
+        { name = "Thunder Bluff", point = pt(1, -1197.2, 29.7), known = true },
+        { name = "Orgrimmar", point = pt(1, 1677.6, -4315.7), known = true },
+        { name = "Crossroads", point = pt(1, -441.8, -2596.1), known = true },
+        { name = "Sun Rock Retreat", point = pt(1, 966.6, 1040.3), known = true },
+    } }
+    local start = pt(1, 919.2, 821.8)
+    local function split(s)
+        local out = {}
+        for part in (s .. "|"):gmatch("(.-)|") do out[#out + 1] = part end
+        return out
+    end
+    local function load()
+        local tasks, byId = {}, {}
+        for _, line in ipairs(SUN_ROCK) do
+            local f = split(line)
+            local t = { id = f[1], kind = f[2], deps = {}, loc = pt(tonumber(f[4]), tonumber(f[5]), tonumber(f[6])),
+                        est = tonumber(f[7]), mobLevel = tonumber(f[9] or ""), xpWeight = tonumber(f[10] or "") }
+            for d in f[3]:gmatch("[^,]+") do t.deps[#t.deps + 1] = d end
+            t.deferred = f[8]:sub(1, 1) == "d" or nil
+            t.teleport = f[8]:find("t", 1, true) and true or nil
+            tasks[#tasks + 1] = t
+            byId[t.id] = t
+        end
+        for _, t in ipairs(tasks) do t.dependents = {} end
+        for _, t in ipairs(tasks) do for _, d in ipairs(t.deps) do byId[d].dependents[#byId[d].dependents + 1] = t.id end end
+        P.ApplyLevelGates(tasks, byId, 18, 0.418)
+        return tasks, byId
+    end
+    local planCost = T.NewCost(net)
+    local seeds = { { name = "flights at full time", travel = T.NewCost(net, 1.0) },
+                    { name = "walking only", travel = function(a, b) return T.Walk(net, a, b) end } }
+    local opts = { logCount = 22, logMax = 40 }
+    local function solve(withSeeds)
+        local tasks, byId = load()
+        P.travelFn = planCost
+        local o = withSeeds and setmetatable({ seeds = withSeeds }, { __index = opts }) or opts
+        local order, _, seed = P.Solve(tasks, byId, start, o)
+        P.travelFn = planCost
+        local at = {}
+        for i, t in ipairs(order) do at[t.id] = i end
+        return order, at, P.RouteCost(order, start), seed, tasks
+    end
+    local one, oneAt, oneCost = solve(nil)
+    check("first guess: one start leaves Sun Rock for the north Barrens first (the diag's route)",
+        oneAt["O881:1"] < oneAt["T6301"] and oneAt["O881:1"] < oneAt["T6421"], oneAt["O881:1"] .. " vs " .. oneAt["T6301"])
+    local three, threeAt, threeCost, seed = solve(seeds)
+    check("first guess: with three starts Sun Rock's turn-ins come before the Barrens",
+        threeAt["T6301"] < threeAt["O875:1"] and threeAt["T6421"] < threeAt["O875:1"],
+        threeAt["T6301"] .. "/" .. threeAt["T6421"] .. " vs " .. threeAt["O875:1"])
+    check("first guess: cheaper by the add-on's own costs", threeCost < oneCost - 150, string.format("%.0f vs %.0f", threeCost, oneCost))
+    check("first guess: and in real time (flights at full time)", (function()
+        P.travelFn = seeds[1].travel
+        local a, b = P.RouteCost(three, start), P.RouteCost(one, start)
+        P.travelFn = planCost
+        return a < b - 150
+    end)())
+    check("first guess: says which start won", seed == "flights at full time", tostring(seed))
+    check("first guess: the route is valid and complete", #three == #SUN_ROCK and P.IsValid(three, opts))
+    local flewBack = false
+    local pos = start
+    for _, t in ipairs(three) do
+        if t.id == "T6421" then break end
+        local _, mode = T.Leg(net, pos, t.loc)
+        if mode == "fly" then flewBack = true end
+        pos = t.loc
+    end
+    check("first guess: no flight before the Sun Rock turn-ins", not flewBack)
+
+    -- a start that can't do better keeps the normal route (no flip-flopping on near-ties)
+    local _, _, sameCost, sameSeed = solve({ { name = "same", travel = planCost } })
+    check("first guess: an equal start doesn't win", sameSeed == nil and math.abs(sameCost - oneCost) < 0.01, tostring(sameSeed))
+    -- big plans only get the normal start (the guide must keep up)
+    local calls = 0
+    local saved = P.SEED_MAX_TASKS
+    P.SEED_MAX_TASKS = 10
+    local _, _, _, bigSeed = solve({ { name = "counted", travel = function(a, b) calls = calls + 1; return planCost(a, b) end } })
+    P.SEED_MAX_TASKS = saved
+    check("first guess: past SEED_MAX_TASKS only the normal start runs", bigSeed == nil and calls == 0, calls)
+    -- level waits stay what the normal start left (another start can't win by lowering them)
+    local _, _, _, _, tasks1 = solve(nil)
+    local _, _, _, _, tasks3 = solve(seeds)
+    local sameGates = true
+    for i, t in ipairs(tasks1) do if t.minTurnins ~= tasks3[i].minTurnins then sameGates = false end end
+    check("first guess: level waits are the normal start's", sameGates)
+
+    -- random maps: three starts are never worse, and the route stays valid
+    math.randomseed(24)
+    local better, worse, invalid = 0, 0, 0
+    for _ = 1, 12 do
+        local rnet = { speed = 7, nodes = {
+            { name = "A", point = pt(0, 0, 0), known = true }, { name = "B", point = pt(0, 5000, 0), known = true },
+            { name = "C", point = pt(0, 2500, 4000), known = true } } }
+        local active = {}
+        for q = 1, 12 do
+            local objs = {}
+            for k = 1, math.random(1, 2) do
+                objs[k] = { index = k, type = "monster", need = 4, have = 0, loc = pt(0, math.random(0, 5000), math.random(0, 4000)),
+                            mobLevel = math.random(14, 20) }
+            end
+            active[q] = { id = q, title = "Q" .. q, objectives = objs, turnin = pt(0, math.random(0, 5000), math.random(0, 4000)) }
+        end
+        local function ctx(s)
+            return { travel = T.NewCost(rnet), start = pt(0, 2500, 2000), level = 17, xpFrac = 0.5, active = active,
+                     logCount = 12, logMax = 40, seeds = s }
+        end
+        local p1 = P.Plan(ctx(nil))
+        local p3 = P.Plan(ctx({ { name = "full", travel = T.NewCost(rnet, 1.0) }, { name = "walk", travel = function(a, b) return T.Walk(rnet, a, b) end } }))
+        P.travelFn = T.NewCost(rnet)
+        local c1, c3 = P.RouteCost(p1.order, pt(0, 2500, 2000)), P.RouteCost(p3.order, pt(0, 2500, 2000))
+        if c3 < c1 - 0.5 then better = better + 1 elseif c3 > c1 + 0.5 then worse = worse + 1 end
+        if #p3.order ~= #p1.order or not P.IsValid(p3.order, { logCount = 12, logMax = 40 }) then invalid = invalid + 1 end
+    end
+    check("first guess: on random maps never worse", worse == 0, worse)
+    check("first guess: on random maps always valid and complete", invalid == 0, invalid)
+    check("first guess: on random maps sometimes better", better > 0, better)
+
+    -- the full-time cost: a minute in the air is a minute
+    local function W(x, y) return pt(0, x, y) end
+    local fnet = { speed = 7, nodes = { { name = "West", point = W(0, 0), known = true }, { name = "East", point = W(6000, 0), known = true } } }
+    local afk, full = T.NewCost(fnet)(W(0, 100), W(6000, 100)), T.NewCost(fnet, 1.0)(W(0, 100), W(6000, 100))
+    local _, mode, _, _, air = T.Leg(fnet, W(0, 100), W(6000, 100))
+    check("full-time cost: the flight's air time counts in full", mode == "fly" and math.abs((full - afk) - air * (1 - T.AFK_WEIGHT)) < 0.01,
+        string.format("%.1f %.1f %s", afk, full, tostring(air)))
+    check("full-time cost: never more than walking", full <= T.Walk(fnet, W(0, 100), W(6000, 100)))
+    check("full-time cost: the AFK weight is left as it was", T.AFK_WEIGHT == 0.35, T.AFK_WEIGHT)
+    check("HasFlights: a known flight path", T.HasFlights(fnet))
+    check("HasFlights: none known", not T.HasFlights({ nodes = { { name = "X", point = W(0, 0), known = false } } }))
+    check("HasFlights: a zeppelin counts", T.HasFlights({ nodes = {}, zeppelins = { {} } }))
+
+    -- the add-on passes both extra starts when you fly, none when you walk
+    M.log = { { id = 2, title = "Kobold Camp Cleanup", level = 2, complete = false,
+                objectives = { { text = "Kobold Vermin slain: 2/6", type = "monster", finished = false, numFulfilled = 2, numRequired = 6 } } } }
+    M.taxiNodes = { { name = "Home Post", position = { x = 0.60, y = 0.42 }, isUndiscovered = false, faction = 2, nodeID = 11 } }
+    ns.charDB.flightPaths = { ["Home Post"] = true }
+    local seen
+    local realPlan = P.Plan
+    P.Plan = function(c) seen = c.seeds; return realPlan(c) end
+    fullPlan(ns)
+    check("Ladder: flying, the planner gets the full-time and walking starts", seen and #seen == 2
+        and seen[1].name == "flights at full time" and seen[2].name == "walking only")
+    ns.charDB.flightPaths = nil
+    fullPlan(ns)
+    check("Ladder: no flight path known, no extra starts", seen == nil)
+    P.Plan = realPlan
+    M.taxiNodes = {}
+end
+
+---------------------------------------------------------------------------
+-- 15k. 0.3.25: "I've been abandoning old quest lines": an abandoned quest could be picked up
+-- again, so it came straight back as a new quest to fetch. Now it's ignored (undo: unignore <id>).
+---------------------------------------------------------------------------
+do
+    local ns = setup()
+    local L = ns.Ladder
+    local printed = {}
+    local realPrint = ns.Print
+    ns.Print = function(fmt, ...) printed[#printed + 1] = select("#", ...) > 0 and string.format(fmt, ...) or fmt end
+    check("abandon: taken as abandoned", L.NoteRemoved(870, { id = 870, title = "The Forgotten Pools" }) == true
+        and ns.charDB.ignored[870] == true)
+    check("abandon: says so, with the undo", printed[1] and printed[1]:find("The Forgotten Pools", 1, true)
+        and printed[1]:find("/ladder unignore 870", 1, true), printed[1])
+    L.turnedIn[871] = true
+    check("abandon: a turned-in quest isn't", L.NoteRemoved(871, { id = 871, title = "X" }) == false and not ns.charDB.ignored[871])
+    check("abandon: a failed one isn't (the hint says abandon it and pick it up again)",
+        L.NoteRemoved(853, { id = 853, title = "Apothecary Zamah", failed = true }) == false and not ns.charDB.ignored[853])
+    M.completed[872] = true
+    check("abandon: one the game counts as done isn't", L.NoteRemoved(872, { id = 872, title = "Y" }) == false and not ns.charDB.ignored[872])
+    check("abandon: a quest that wasn't in the log we saw isn't", L.NoteRemoved(873, nil) == false and not ns.charDB.ignored[873])
+    -- through the game's events
+    L.snapshot = { [874] = { id = 874, title = "Lost in Battle" } }
+    ns.DispatchEvent("QUEST_REMOVED", 874)
+    check("abandon: removed from the log without a turn-in: ignored", ns.charDB.ignored[874] == true)
+    L.snapshot = { [875] = { id = 875, title = "Harpy Lieutenants" } }
+    ns.DispatchEvent("QUEST_TURNED_IN", 875, 100, 0)
+    ns.DispatchEvent("QUEST_REMOVED", 875)
+    check("abandon: turned in, then removed: not ignored", not ns.charDB.ignored[875])
+    ns.DispatchEvent("QUEST_ACCEPTED", 874)
+    check("abandon: accepting it again un-ignores it", not ns.charDB.ignored[874])
+    _G.SlashCmdList.QUESTLADDER("unignore 870")
+    check("abandon: /ladder unignore <id> clears just that one", not ns.charDB.ignored[870])
+    ns.Print = realPrint
 end
 
 ---------------------------------------------------------------------------

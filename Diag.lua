@@ -236,15 +236,86 @@ check("plan", "Route plan", function(ctx)
                 tostring(stepOfTask[t] or "?"), turnedIn[t] or 0)
         end
     end
+    -- New quests left out for low XP (minQuestValue), and where the next good area is
+    data.minQuestValue = ns.db.minQuestValue
+    data.solidQuestXP = ctx.player and ns.Data.SolidQuestXP and ns.Data.SolidQuestXP(ctx.player.level) or nil
+    data.skippedLowValue = {}
+    for i, s in ipairs(plan.skippedLowValue or {}) do
+        if i > 30 then break end
+        data.skippedLowValue[#data.skippedLowValue + 1] = string.format("%s %s | %s XP | %s%% of a solid quest",
+            tostring(s.id), tostring(s.title), s.xp and tostring(math.floor(s.xp + 0.5)) or "?",
+            s.ratio and tostring(math.floor(s.ratio * 100 + 0.5)) or "?")
+    end
+    if plan.nextArea then
+        local okT, text = try(L.NextAreaText, plan.nextArea)
+        data.nextArea = okT and text or "?"
+    end
+    -- New quests left out because their detour earns less XP than killing mobs that long
+    data.notWorthTrip = {}
+    for i, p in ipairs(plan.pruned or {}) do
+        if i > 30 then break end
+        data.notWorthTrip[#data.notWorthTrip + 1] = string.format("%s %s | %s XP | adds %s s%s | %s%% of grinding",
+            tostring(p.questId), tostring(p.title), p.xp and tostring(math.floor(p.xp + 0.5)) or "?",
+            tostring(math.floor((p.seconds or 0) + 0.5)), (p.together or 1) > 1 and (" for " .. p.together .. " together") or "",
+            tostring(math.floor((p.worth or 0) * 100 + 0.5)))
+    end
+    data.tripCheck = ns.db.tripCheck
+    -- 0.4.0: quests in your log you've outgrown: which the route left out, and which it keeps
+    data.outgrown = {}
+    for i, p in ipairs(plan.outgrown or {}) do
+        if i > 30 then break end
+        local q = p.quest or {}
+        data.outgrown[#data.outgrown + 1] = string.format("dropped %s %s [%s] | %s XP | saves %s s%s | %s%% of grinding",
+            tostring(p.questId), tostring(p.title), tostring(q.level), p.xp and tostring(math.floor(p.xp + 0.5)) or "?",
+            tostring(math.floor((p.seconds or 0) + 0.5)), (p.together or 1) > 1 and (" for " .. p.together .. " together") or "",
+            tostring(math.floor((p.worth or 0) * 100 + 0.5)))
+    end
+    for _, q in ipairs(plan.active or {}) do
+        local dropped = false
+        for _, p in ipairs(plan.outgrown or {}) do if p.questId == q.id then dropped = true end end
+        if q.outgrown and not dropped and #data.outgrown < 40 then
+            data.outgrown[#data.outgrown + 1] = string.format("kept %s %s [%s] | %s XP", tostring(q.id), tostring(q.title),
+                tostring(q.level), q.tripXP and tostring(math.floor(q.tripXP + 0.5)) or "?")
+        end
+    end
+    -- which first guess the route grew from (Planner: "More than one first guess")
+    data.routeStart = plan.seed or "normal"
+    -- Timed quests: what the game's timer says, the item, and where the quest sits in the route
+    data.timerApi = { getTimeAllowed = C_QuestLog ~= nil and C_QuestLog.GetTimeAllowed ~= nil,
+                      legacy = GetQuestTimers ~= nil and GetQuestIndexForTimer ~= nil }
+    data.timed = {}
+    local firstStep = {}
+    for i, s in ipairs(plan.steps) do
+        for _, t in ipairs(s.tasks) do if t.urgent and t.questId and not firstStep[t.questId] then firstStep[t.questId] = i end end
+    end
+    for _, q in ipairs(plan.active or {}) do
+        if q.timed then
+            local tm = q.timer
+            data.timed[#data.timed + 1] = string.format("%s %s | %s | item %s | first at step %s", tostring(q.id), tostring(q.title),
+                tm and string.format("%s timer %.0f s, %.0f s gone", tostring(tm.source), tm.total, tm.elapsed) or "no timer read (quest text says timed)",
+                tostring(q.timedItem), tostring(firstStep[q.id] or "?"))
+        end
+    end
+    if #data.timed > 0 then
+        local okT, list = try(L.TimedQuests)
+        data.timerLines = {}
+        for _, e in ipairs(okT and list or {}) do
+            local okX, text = try(L.TimerText, e)
+            data.timerLines[#data.timerLines + 1] = okX and text or "?"
+        end
+    end
     data.candidateList = {}
     for i, c in ipairs(plan.candidates or {}) do
         if i > 40 then data.candidateList[#data.candidateList + 1] = "..." break end
-        data.candidateList[#data.candidateList + 1] = string.format("%s %s | %s yd%s", tostring(c.id), tostring(c.title),
-            tostring(yards(c.pickup) or "?"), c.chainedFrom and (" | after " .. tostring(c.chainedFrom)) or "")
+        data.candidateList[#data.candidateList + 1] = string.format("%s %s | %s yd%s | %s XP%s", tostring(c.id), tostring(c.title),
+            tostring(yards(c.pickup) or "?"), c.chainedFrom and (" | after " .. tostring(c.chainedFrom)) or "",
+            c.tripXP and tostring(math.floor(c.tripXP + 0.5)) or "?", c.keep and (" | keep: " .. tostring(c.worthWhy)) or "")
     end
     -- Replay data: the route's tasks (in order) and the travel network, so the planner can be
     -- re-run offline on your real map. One compact line each:
-    -- id|kind|deps|cont|x|y|est|flags|mobLevel|xpWeight|wait (wait = turn-ins before it, as planned)
+    -- id|kind|deps|cont|x|y|est|flags|mobLevel|xpWeight|wait|tripXP|keep (wait = turn-ins before it,
+    -- as planned; tripXP and keep on new quests' pickups). replay.pruned: the tasks of the quests
+    -- left out as not worth the trip, same format.
     local function xy(p)
         if type(p) ~= "table" or not p.wx then return "-|-|-" end
         return string.format("%s|%.1f|%.1f", tostring(p.cont), p.wx, p.wy or 0)
@@ -252,12 +323,26 @@ check("plan", "Route plan", function(ctx)
     local replay = { start = xy(plan.player and plan.player.point), logCount = plan.logCount, logMax = plan.logMax,
                      level = plan.player and plan.player.level, xpFrac = plan.player and plan.player.xpFrac,
                      tasks = {}, nodes = {} }
+    local function line(t)
+        local flags = (t.deferred and "d" or "") .. (t.teleport and "t" or "") .. (t.visit and ("v:" .. t.visit) or "")
+        -- tripXP: on new quests' pickups, and (0.4.0) on outgrown log quests' tasks, flagged "o"
+        local q = (t.kind == "pickup" or (t.quest and t.quest.outgrown)) and t.quest or nil
+        return table.concat({ tostring(t.id), tostring(t.kind), table.concat(t.deps or {}, ","),
+            xy(t.loc), tostring(t.est or 0), flags, tostring(t.mobLevel or ""), tostring(t.xpWeight or ""),
+            t.minTurnins and string.format("%.1f", t.minTurnins) or "",
+            q and q.tripXP and tostring(math.floor(q.tripXP + 0.5)) or "",
+            q and ((q.keep and "k") or (t.kind ~= "pickup" and q.outgrown and "o")) or "" }, "|")
+    end
     for i, t in ipairs(plan.order or {}) do
         if i > 150 then break end
-        local flags = (t.deferred and "d" or "") .. (t.teleport and "t" or "") .. (t.visit and ("v:" .. t.visit) or "")
-        replay.tasks[#replay.tasks + 1] = table.concat({ tostring(t.id), tostring(t.kind), table.concat(t.deps or {}, ","),
-            xy(t.loc), tostring(t.est or 0), flags, tostring(t.mobLevel or ""), tostring(t.xpWeight or ""),
-            t.minTurnins and string.format("%.1f", t.minTurnins) or "" }, "|")
+        replay.tasks[#replay.tasks + 1] = line(t)
+    end
+    replay.pruned = {}
+    local prunedId = {}
+    for _, p in ipairs(plan.pruned or {}) do prunedId[p.questId] = true end
+    for _, p in ipairs(plan.outgrown or {}) do prunedId[p.questId] = true end
+    for _, t in ipairs(plan.tasks or {}) do
+        if t.questId and prunedId[t.questId] and #replay.pruned < 120 then replay.pruned[#replay.pruned + 1] = line(t) end
     end
     local net = plan.net
     if net then
@@ -291,8 +376,12 @@ check("plan", "Route plan", function(ctx)
     end
     data.travelAndStops = stops
     if #plan.steps == 0 then return "warn", "the plan is empty (no quests in reach?)", data end
-    local summary = string.format("%d steps, current: %s; %d quests ready to turn in", #plan.steps,
-        data.next[1] and data.next[1].title or "?", #data.readyTurnins)
+    local summary = string.format("%d steps, current: %s; %d quests ready to turn in; %d new quests planned, %d not worth the trip; %d outgrown left out",
+        #plan.steps, data.next[1] and data.next[1].title or "?", #data.readyTurnins,
+        data.candidates - #(plan.pruned or {}), #(plan.pruned or {}), #(plan.outgrown or {}))
+    if data.planJobRunning then
+        return "warn", summary .. "; a newer plan was still being worked out, run diag again in a few seconds", data
+    end
     -- a finished quest whose NPC is close but whose turn-in waits several steps is worth a look
     for _, r in ipairs(data.readyTurnins) do
         if r.yards and r.yards <= 300 and r.step and r.step > L.current + 2 then
@@ -524,6 +613,42 @@ check("gear", "3b. Gear scoring (reward picks and gear in your bags)", function(
         #data.items, #data.picks, fromStats, fromTooltip, unread), data
 end)
 
+check("goodies", "3c. Forever extras (bags, riding, sleeping bag chain, crates, must-do quests)", function(ctx)
+    local G, p = ns.Goodies, ctx.player
+    if not (G and p) then return "skip", "no player info", nil end
+    local data = { bags = {}, tooltipApi = C_TooltipInfo ~= nil and type(C_TooltipInfo.GetItemByID) == "function" }
+    for i, e in ipairs(G.EquippedBags()) do data.bags[i] = string.format("%d slots%s", e.slots, e.special and " (special)" or "") end
+    data.smallestBag = G.SmallestBag()
+    local plan = ns.Ladder.plan
+    local buy = plan and plan.bagToBuy
+    data.bagToBuy = buy and string.format("%s (%d slots, ~%s) from %s", tostring(buy.name), buy.slots, ns.FormatMoney(buy.price),
+        tostring(buy.vendor)) or nil
+    data.vendorBagsIndexed = #(ns.Data.vendorBags or {})
+    data.questsWithBagRewards = count(ns.Data.bagRewards)
+    local okR, ride = try(G.RidingHint, setmetatable({ money = value(GetMoney) or p.money }, { __index = p }))
+    data.riding = okR and ride or nil
+    data.ridingGoldKeptAside = ns.Gear.NeedsRidingGold(p)
+    local cozy = plan and plan.cozyStart
+    data.cozyStart = cozy and string.format("%s (%s) at %s", tostring(cozy.title), tostring(cozy.questId), tostring(cozy.giver)) or nil
+    local okN, npc = try(G.CrateNpc, p)
+    data.crateNpc = okN and npc and npc.name or nil
+    local okC, crates = try(G.CratesInBags, ctx.bags)
+    data.cratesInBags = okC and #crates or 0
+    data.mustDoInPlan = {}
+    for _, t in ipairs((plan and plan.order) or {}) do
+        if t.kind == "pickup" and #data.mustDoInPlan < 15 then
+            local note = G.MustDo(t.questId)
+            if note then data.mustDoInPlan[#data.mustDoInPlan + 1] = string.format("%s %s | %s", t.questId, tostring(t.quest and t.quest.title), note) end
+        end
+    end
+    if data.vendorBagsIndexed > 0 and not G.BagSlots(ns.Data.vendorBags[1].itemId) then
+        return "warn", "couldn't read a bag's slot count from its tooltip; bag advice is off", data
+    end
+    return "info", string.format("smallest bag %d slots; %s; %d must-do quests in the plan; crate NPC %s",
+        data.smallestBag, data.bagToBuy and ("buy: " .. data.bagToBuy) or "no bag to buy", #data.mustDoInPlan,
+        tostring(data.crateNpc)), data
+end)
+
 check("questitems", "4. Quest items (GetQuestLogSpecialItemInfo, bag quest info)", function(ctx)
     local hasSpecial = type(GetQuestLogSpecialItemInfo) == "function"
     local hasBagInfo = C_Container ~= nil and type(C_Container.GetContainerItemQuestInfo) == "function"
@@ -562,6 +687,31 @@ check("questitems", "4. Quest items (GetQuestLogSpecialItemInfo, bag quest info)
             for _, itemId in ipairs(items) do names[#names + 1] = itemId .. " " .. str(ns.Hints.ItemName(itemId)) end
             data.toUse[#data.toUse + 1] = string.format("%s %s: %s", tostring(q.id), str(q.title), table.concat(names, ", "))
         end
+    end
+    -- 0.3.25: the button only shows an item once you've selected (or reached) its target; this
+    -- step's quests, and since 0.3.26 a later step's ("step N") when you go there out of order
+    data.stepUse = {}
+    local okTasks, per, later, at = try(ns.Hints.UseTasks, ns.Ladder and ns.Ladder.plan, ctx.step)
+    if not okTasks then per, later, at = {}, {}, {} end
+    local function useLine(qid, tasks, where)
+        local q = ctx.byId and ctx.byId[qid]
+        local okI, items = try(ns.Hints.UseItemsFor, qid, q, okB and bagUse or nil)
+        if q and okI and #items > 0 then
+            local okT, targets = try(ns.Hints.UseTargets, tasks)
+            targets = okT and targets or nil
+            local okR, ready, sel = try(ns.Hints.UseReady, targets, tasks, ctx.player and ctx.player.point)
+            data.stepUse[#data.stepUse + 1] = string.format("%s %d %s: item %s | on %s | %s", where, qid, str(q.title),
+                table.concat(items, ","),
+                targets and table.concat(targets.names, ", ") or "nothing known (place)",
+                not okR and "?" or ready and ("ready" .. (sel and (", selected " .. str(sel)) or ", standing at it")) or "waiting")
+        end
+    end
+    for qid, tasks in pairs(per) do useLine(qid, tasks, "this step") end
+    for qid, tasks in pairs(later) do useLine(qid, tasks, "step " .. tostring(at[qid])) end
+    data.selected = {}
+    local okSel, selected = try(ns.WorldMarks.Selected)
+    for _, s in ipairs(okSel and selected or {}) do
+        data.selected[#data.selected + 1] = string.format("%s: %s %s %s", str(s.unit), str(s.kind), tostring(s.id), str(s.name))
     end
     if not hasSpecial and not hasBagInfo then return "fail", "neither quest-item API exists", data end
     if data.specialError then return "fail", "GetQuestLogSpecialItemInfo errored: " .. str(data.specialError), data end
@@ -678,6 +828,16 @@ check("bags", "8. Bag boxes (Blizzard / Bagnon / Baganator)", function(ctx)
     for key, box in pairs(HL.Active() or {}) do
         data.activeBoxes[key] = { target = frameName(box.target), label = box.label and value(box.label.GetText, box.label),
                                   itemId = box.itemId }
+    end
+    -- what the bag planner suggests for each item, and the item facts behind it
+    data.suggestions = {}
+    local okS, list = pcall(ns.Bags.Suggestions, ctx.bags, ns.Ladder.snapshot or {}, ns.Ladder.plan)
+    for _, e in ipairs(okS and list or {}) do
+        if #data.suggestions >= 40 then break end
+        local info = ns.Gear.ItemInfo(e.link or e.itemId)
+        data.suggestions[#data.suggestions + 1] = string.format("%s %s | class %s/%s q%s%s | %s: %s", tostring(e.itemId),
+            tostring(e.name), tostring(info and info.classID), tostring(info and info.subClassID), tostring(info and info.quality),
+            info and info.craftingReagent and " reagent" or "", tostring(e.action), tostring(e.reason))
     end
     if not ns.db.highlights then return "skip", "highlights are off (/ladder highlights)", data end
     if not probe then return "skip", "your bags are empty", data end
@@ -978,6 +1138,51 @@ function Diag.Print(run)
     ns.Print("%d run(s) stored. Type /reload to write them to SavedVariables\\QuestLadder.lua", #QuestLadderDiag.runs)
 end
 
+-- Right after /reload the add-on first plans your quest log alone, then again once the quest
+-- index is built, with new quests in it. A diag taken in between saved the first plan: 0 new
+-- quests, and replay data that can't show the real route (0.3.23 diag at Sun Rock Retreat). So
+-- the diag waits until no plan is being worked out (up to WAIT_MAX seconds) before it looks.
+Diag.WAIT_MAX = 30
+Diag.WAIT_STEP = 0.5
+
+--- Why the route isn't settled yet (nil = it is).
+function Diag.Busy()
+    local L, Data = ns.Ladder, ns.Data
+    if Data and Data.lib and not Data.ready then return "the quest index is still being built" end
+    if ns.IsJobRunning("QuestLadder.index") then return "the quest index is still being built" end
+    if ns.IsJobRunning("QuestLadder.plan") then return "the route is still being planned" end
+    if ns.IsPending and ns.IsPending("replan") then return "a replan is about to start" end
+    if L and L.plan == nil and Data and Data.lib then return "no route planned yet" end
+    return nil
+end
+
+local waiting = false
+local function runWhenSettled(arg)
+    local reason = Diag.Busy()
+    if not reason or not (C_Timer and C_Timer.After) then
+        Diag.Print(Diag.Run(arg))
+        return
+    end
+    if waiting then ns.Print("diag: already waiting for the route to settle") return end
+    waiting = true
+    ns.Print("diag: waiting until %s finishes (up to %d s) - don't /reload until the results print", reason, Diag.WAIT_MAX)
+    local waited = 0
+    local function poll()
+        waited = waited + Diag.WAIT_STEP
+        local still = Diag.Busy()
+        if still and waited < Diag.WAIT_MAX then
+            C_Timer.After(Diag.WAIT_STEP, poll)
+            return
+        end
+        waiting = false
+        local run = Diag.Run(arg)
+        run.waited = waited
+        if still then run.gaveUpWaiting = still end
+        Diag.Print(run)
+    end
+    C_Timer.After(Diag.WAIT_STEP, poll)
+end
+
 ns.On("RUN_DIAG", function(arg)
     arg = arg or ""
     if arg:lower() == "clear" then
@@ -985,5 +1190,6 @@ ns.On("RUN_DIAG", function(arg)
         ns.Print("diag history cleared")
         return
     end
-    Diag.Print(Diag.Run(arg))
+    if arg:lower() == "now" then Diag.Print(Diag.Run("")) return end -- don't wait for the route
+    runWhenSettled(arg)
 end)

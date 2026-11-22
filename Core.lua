@@ -3,7 +3,7 @@
 
 local ADDON, ns = ...
 ns.ADDON = ADDON or "QuestLadder"
-ns.VERSION = "0.3.18"
+ns.VERSION = "0.4.0"
 
 ---------------------------------------------------------------------------
 -- Settings
@@ -22,6 +22,8 @@ ns.defaults = {
     pickupRadius = 900,        -- yards: how far away a quest giver may be to be considered
     chainDepth = 2,            -- follow-up quests to chain after a planned turn-in
     levelsAbove = 2,           -- skip quests more than this many levels above you
+    minQuestValue = 0.5,       -- skip new quests worth under this share of a solid quest's XP at your level (0 = off)
+    tripCheck = true,          -- skip new quests whose detour earns less XP than killing mobs for that long
     skipDungeonQuests = true,  -- objectives that only exist inside instances
     skipEscortsAndElites = false,
 
@@ -273,6 +275,8 @@ end
 -- Debounce helper
 ---------------------------------------------------------------------------
 local pending = {}
+--- True while a debounced call for `key` is waiting to fire.
+function ns.IsPending(key) return pending[key] == true end
 function ns.Debounce(key, delay, fn)
     if pending[key] then return end
     pending[key] = true
@@ -317,7 +321,7 @@ local toggles = {
     auto = { "autoAccept", "autoTurnIn" },
     autopick = { "autoPickReward" },
     unstarted = { "includeUnstarted" },
-    dungeons = { "skipDungeonQuests", invert = true },
+    trips = { "tripCheck" },
     waypoints = { "waypoints" },
     hints = { "showHints" },
     flights = { "useFlights" },
@@ -334,17 +338,24 @@ local function help()
     print("  /ladder                 show or hide the guide")
     print("  /ladder replan          rebuild the route now")
     print("  /ladder skip            skip the current step (unstarted quests are ignored)")
-    print("  /ladder unignore        clear all ignored quests")
+    print("  /ladder unignore [id]   clear all ignored quests (abandoned ones too), or just one")
     print("  /ladder bags            bag planner: what to sell or destroy")
     print("  /ladder gear            gear upgrades (quest rewards + Auctionator)")
     print("  /ladder reserve <n>     bag slots to keep free (now " .. tostring(ns.db.reserveSlots) .. ")")
     print("  /ladder gold <amount>   gold to keep for training, e.g. 5g or auto")
+    print("  /ladder dungeons        dungeon quests you can pick up now, by dungeon")
+    print("  /ladder dungeons plan   toggle planning dungeon quests (now " .. onOff(not ns.db.skipDungeonQuests) .. ")")
+    print("  /ladder skipped         new quests left out of the plan, and why")
+    print("  /ladder outgrown        quests in your log you've outgrown, and which to drop when it's full")
+    print("  /ladder trips           toggle skipping quests not worth the walk, new and outgrown (now " .. onOff(ns.db.tripCheck) .. ")")
+    print("  /ladder minxp <percent> skip new quests worth under this % of a solid quest at your level (now "
+        .. math.floor((ns.db.minQuestValue or 0) * 100 + 0.5) .. "%, 0 = keep all)")
     print("  /ladder weight <stat> <n>  override a stat weight (str agi sta int spi armor dps ap sp)")
-    print("  /ladder auto|autopick|unstarted|dungeons|waypoints|hints  toggle a feature")
+    print("  /ladder auto|autopick|unstarted|waypoints|hints  toggle a feature")
     print("  /ladder flights|hearth|bind|discover|highlights|marks     toggle travel / highlight features")
     print("  /ladder interacticons   turn on Blizzard's icons over interactable objects")
     print("  /ladder npcplates       show friendly NPC nameplates (so quest givers get a marker)")
-    print("  /ladder diag [label]    run the in-game checks and save them (then /reload); diag clear")
+    print("  /ladder diag [label]    run the in-game checks once the route is planned, save them (then /reload); diag now, diag clear")
 end
 
 SLASH_QUESTLADDER1 = "/ladder"
@@ -363,9 +374,16 @@ SlashCmdList.QUESTLADDER = function(input)
     elseif cmd == "skip" then
         ns.Fire("SKIP_STEP")
     elseif cmd == "unignore" then
-        for k in pairs(ns.charDB.ignored) do ns.charDB.ignored[k] = nil end
-        for k in pairs(ns.charDB.deferred) do ns.charDB.deferred[k] = nil end
-        ns.Print("ignored quests cleared")
+        local id = tonumber(rest)
+        if id then
+            -- one quest (an abandoned quest you want suggested again)
+            ns.charDB.ignored[id], ns.charDB.deferred[id] = nil, nil
+            ns.Print("quest %d can be suggested again", id)
+        else
+            for k in pairs(ns.charDB.ignored) do ns.charDB.ignored[k] = nil end
+            for k in pairs(ns.charDB.deferred) do ns.charDB.deferred[k] = nil end
+            ns.Print("ignored quests cleared")
+        end
         ns.Fire("REQUEST_REPLAN", "unignore")
     elseif cmd == "bags" then
         ns.Fire("SHOW_PANEL", "bags")
@@ -379,6 +397,29 @@ SlashCmdList.QUESTLADDER = function(input)
             ns.Fire("REQUEST_REPLAN", "settings")
         else
             ns.Print("usage: /ladder reserve <0-30>")
+        end
+    elseif cmd == "dungeons" and rest ~= "" then
+        -- 0.3.20 gave "/ladder dungeons" to the list, which hid the old toggle: "plan" toggles now
+        ns.db.skipDungeonQuests = not ns.db.skipDungeonQuests
+        ns.Print("dungeon quests in the plan: %s", onOff(not ns.db.skipDungeonQuests))
+        ns.Fire("SETTINGS_CHANGED")
+        ns.Fire("REQUEST_REPLAN", "settings")
+    elseif cmd == "dungeons" then
+        if ns.Goodies then ns.Goodies.PrintDungeonQuests() end
+    elseif cmd == "skipped" or cmd == "outgrown" then
+        if ns.Ladder then ns.Ladder.PrintSkipped() end
+    elseif cmd == "minxp" then
+        local n = tonumber((rest:gsub("%%", "")))
+        if n and n >= 0 and n <= 200 then
+            ns.db.minQuestValue = n / 100
+            if n == 0 then
+                ns.Print("planning every quest, whatever its XP")
+            else
+                ns.Print("skipping new quests worth under %d%% of a solid quest at your level", math.floor(n + 0.5))
+            end
+            ns.Fire("REQUEST_REPLAN", "settings")
+        else
+            ns.Print("usage: /ladder minxp <0-200>  (percent of a solid quest's XP at your level; 0 = keep all)")
         end
     elseif cmd == "gold" then
         if rest:lower() == "auto" then
